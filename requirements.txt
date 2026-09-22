@@ -1,0 +1,7 @@
+yt-dlp
+yt-dlp-ejs
+curl_cffi>=0.11
+openai-whisper
+requests
+paddleocr
+paddlepaddle

@@ -1,0 +1,11 @@
+{
+  "bot_token": "PUT_YOUR_BOTFATHER_TOKEN_HERE",
+  "chat_id": null,
+  "output_root": "C:\\Users\\YOU\\Desktop\\Video Transcripts",
+  "whisper_model": "small",
+  "last_update_id": 0,
+  "cookies_from_browser": null,
+  "cookies_file": null,
+  "flag_keywords": ["screenshot", "screenshots", "screengrab", "screengrabs",
+                    "screen grab", "screen grabs", "screen shot", "screen shots"]
+}
