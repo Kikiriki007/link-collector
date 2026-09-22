@@ -220,3 +220,7 @@ ever worth wiring up - Instagram/TikTok would need yt-dlp to fix those extractor
 | `run_collect.bat` | Thin wrapper so both Task Scheduler and a manual double-click run the same way. |
 | `setup_task.ps1` | One-time script to register the daily scheduled task. |
 | `log.txt` | Append-only run history — counts, failures, and every personal note. Not committed. |
+
+## License
+
+[MIT](LICENSE)
