@@ -324,6 +324,15 @@ def build_final_name(title: str, transcript_text: str, fallback_id: str) -> str:
     return f"clip-{fallback_id or 'unknown'}"
 
 
+def find_video_file(stage_dir: Path):
+    """Returns the staged video file, or None. Filtered to VIDEO_EXTS rather than a bare
+    video.* glob - a staging dir that already has transcript sidecars (video.json/.srt/.vtt/.txt)
+    from an earlier attempt would otherwise let one of those get handed to Whisper/ffmpeg
+    instead of the actual video."""
+    matches = sorted(p for p in stage_dir.glob("video.*") if p.suffix.lower() in VIDEO_EXTS)
+    return matches[0] if matches else None
+
+
 def unique_dest(parent: Path, name: str) -> Path:
     candidate = parent / name
     n = 2
@@ -491,7 +500,7 @@ def main() -> int:
         # AND any left over from a previous run that got interrupted before this phase.
         staging_dirs = sorted(
             d for d in output_root.rglob("_staging_*")
-            if d.is_dir() and list(d.glob("video.*"))
+            if d.is_dir() and find_video_file(d)
         )
 
         if staging_dirs:
@@ -505,7 +514,7 @@ def main() -> int:
             for i, stage_dir in enumerate(staging_dirs, 1):
                 try:
                     meta = read_source_txt(stage_dir)
-                    video_path = list(stage_dir.glob("video.*"))[0]
+                    video_path = find_video_file(stage_dir)
                     print(f"[{i}/{len(staging_dirs)}] transcribing: {video_path.name}", flush=True)
                     result = model.transcribe(str(video_path), fp16=(device == "cuda"),
                                                verbose=False)
