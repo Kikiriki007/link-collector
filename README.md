@@ -18,6 +18,22 @@ need Claude or any API key besides your own Telegram bot token.
 > this folder in Claude Code (or hand it these instructions) and say "set up link-collector for me."
 > Everything below is also written to be followed manually, with no AI involved at all.
 
+## Requirements
+
+- **Python 3.10+**, **[ffmpeg](https://ffmpeg.org/download.html)** on your PATH (used by both
+  yt-dlp and Whisper), and a Telegram account.
+- **[Node.js](https://nodejs.org/)** on your PATH — only needed for YouTube links (yt-dlp uses it
+  to solve a JS-obfuscated parameter some formats require). Not needed for Instagram/TikTok.
+- **~2 GB free disk**: ~1.5 GB for dependencies (PyTorch for Whisper, PaddlePaddle for OCR - the
+  two ML frameworks are most of that), plus ~600 MB for model weights, downloaded once on first
+  use and cached under your user profile. Your archive folder grows on top of that with every
+  video you keep.
+- **CPU-only is fine** for occasional/personal use - no GPU required. An NVIDIA GPU with a CUDA
+  build of PyTorch (installed yourself, see [pytorch.org](https://pytorch.org/get-started/locally/))
+  transcribes faster, but that's optional.
+- The daily-automation piece (`setup_task.ps1`, Windows Task Scheduler) is **Windows-only**;
+  `collect.py` itself is plain Python and runs fine by hand on macOS/Linux, or via cron there.
+
 ## What you get
 
 For every link you send, once processed:
@@ -95,18 +111,7 @@ video at that timestamp would be the natural next step if this proves useful.
 
 ## Setup
 
-### 1. Prerequisites
-
-- **Python 3.10+**
-- **[ffmpeg](https://ffmpeg.org/download.html)** on your PATH (needed by both yt-dlp and Whisper) —
-  on Windows, easiest via `winget install Gyan.FFmpeg`, then restart your terminal.
-- **[Node.js](https://nodejs.org/)** on your PATH — YouTube requires solving a JS-obfuscated
-  parameter to fetch some formats, and yt-dlp needs a JS runtime for that. `requirements.txt`
-  installs the `yt-dlp-ejs` package (the actual solver script); Node is what runs it. Not needed
-  for Instagram/TikTok links, only YouTube.
-- A Telegram account.
-
-### 2. Get the code and install dependencies
+### 1. Get the code and install dependencies
 
 ```
 git clone <this repo's URL>
@@ -116,19 +121,11 @@ python -m venv .venv
 # source .venv/bin/activate && pip install -r requirements.txt   # macOS/Linux
 ```
 
-That installs `yt-dlp`, `openai-whisper`, `paddleocr`/`paddlepaddle`, and `requests`. All are normal
-open-source PyPI packages — nothing about any of them or their models is bundled in this repo, pip
-downloads them fresh the same as it would for anyone. `paddlepaddle` is a real ML framework
-(similar footprint to installing PyTorch again) - that's the cost of the OCR feature.
+That installs `yt-dlp`, `openai-whisper`, `paddleocr`/`paddlepaddle`, and `requests` — see
+Requirements above for what that costs in disk space. Model weights download on first use; that
+first run will be slower than every run after it.
 
-Whisper and PaddleOCR both run on CPU by default, which is fine for occasional use. If you have an
-NVIDIA GPU and want it faster, install a CUDA build of PyTorch yourself before installing the rest
-(see [pytorch.org](https://pytorch.org/get-started/locally/)) — entirely optional.
-
-Both download their model weights on first use (a few hundred MB each, one-time, cached under your
-user profile) - the first run will be slower than every run after it.
-
-### 3. Create your Telegram bot
+### 2. Create your Telegram bot
 
 1. Open Telegram, message **@BotFather**, send `/newbot`, follow the prompts.
 2. Copy the token it gives you.
@@ -142,7 +139,7 @@ user profile) - the first run will be slower than every run after it.
    It'll print `Detected chat_id: ...` and save it into `config.json`. From now on it'll message
    *you* back, and only you.
 
-### 4. Try it
+### 3. Try it
 
 Share a public Reel/Short link to your bot from your phone (native Share sheet → search for your
 bot's name, or paste the link directly in the chat). Then run:
@@ -158,7 +155,7 @@ as notifications for that chat aren't muted.
 Cancel anytime with **Ctrl+C** — it's safe; nothing partial is left looking finished, and the next
 run picks up exactly where it left off.
 
-### 5. Run it automatically, once a day (Windows only)
+### 4. Run it automatically, once a day (Windows only)
 
 ```
 .\setup_task.ps1                 # defaults to 05:00 daily
