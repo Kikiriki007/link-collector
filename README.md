@@ -20,7 +20,7 @@ need Claude or any API key besides your own Telegram bot token.
 
 ## Requirements
 
-- **Python 3.10+**, **[ffmpeg](https://ffmpeg.org/download.html)** on your PATH (used by both
+- **Python 3.10+**, **[ffmpeg](https://ffmpeg.org/download.html)** on your PATH (for both
   yt-dlp and Whisper), and a Telegram account.
 - **[Node.js](https://nodejs.org/)** on your PATH — only needed for YouTube links (yt-dlp uses it
   to solve a JS-obfuscated parameter some formats require). Not needed for Instagram/TikTok.
@@ -33,7 +33,7 @@ need Claude or any API key besides your own Telegram bot token.
   transcribes faster, but that's optional.
 - The daily-automation piece (`setup_task.ps1`, Windows Task Scheduler) is **Windows-only**;
   `collect.py` itself is plain Python and runs fine by hand on macOS/Linux, or via cron there.
-
+- ~5 minutes for manual setup, see below 
 ## What you get
 
 For every link you send, once processed:
@@ -65,7 +65,7 @@ from `video.txt` (what Whisper heard spoken). Only written when the platform act
 deleted-after-transcribe video whose narrator says little on-mic would otherwise leave nothing
 behind but a near-empty transcript, even if the caption itself had the real context.
 
-## One rule to remember
+## Rules to remember
 
 - Send **just the bare link** → the video is **kept**, no note.
 - Add **any other text** to that same message → the video is **deleted right after transcribing**
@@ -155,7 +155,7 @@ as notifications for that chat aren't muted.
 Cancel anytime with **Ctrl+C** — it's safe; nothing partial is left looking finished, and the next
 run picks up exactly where it left off.
 
-### 4. Run it automatically, once a day (Windows only)
+### 4. (optional) Run it automatically, once a day (Windows only)
 
 ```
 .\setup_task.ps1                 # defaults to 05:00 daily
