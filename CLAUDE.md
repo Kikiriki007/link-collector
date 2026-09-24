@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A single-script personal pipeline: Telegram bot -> yt-dlp download -> Whisper transcription (video)
 or PaddleOCR (photo posts/carousels) -> files organized into a dated, readable archive folder. No
 LLM/AI step in the pipeline itself - it's deterministic. Everything lives in `collect.py`; there is
-no package structure, no tests, and (currently) no git repo initialized in this directory.
+no package structure and no tests.
 
 ## Commands
 
@@ -54,6 +54,8 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    either a direct image fetch (CDN thumbnail URL) or a yt-dlp video download for any video mixed
    into the carousel. Photo posts are *finalized immediately* in this phase (OCR via PaddleOCR,
    `source.txt`, `caption.txt`, rename out of `_staging_*`) since there's no Whisper step for them.
+   The same `delete_video` flag applies: images are unlinked after OCR (except any whose OCR failed);
+   videos mixed into a carousel are never transcribed, so they're always kept.
    Video jobs instead write `source.txt`/`caption.txt` into a `_staging_<update_id>` folder and defer
    transcription to phase 3.
 

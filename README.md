@@ -49,7 +49,7 @@ Video Transcripts/
       source.txt                 # the URL, platform, timestamp, and your personal note if any
 
     your-exam-is-7-days-away-stop/      # a photo post/carousel instead
-      image_01.jpg ... image_09.jpg     # every image in the post
+      image_01.jpg ... image_09.jpg     # every image in the post (unless flagged for deletion)
       caption.txt                       # the post's own caption
       ocr.txt                           # on-image text, one labeled block per image
       source.txt                        # URL, platform, timestamp, item counts, note if any
@@ -69,7 +69,8 @@ behind but a near-empty transcript, even if the caption itself had the real cont
 
 - Send **just the bare link** → the video is **kept**, no note.
 - Add **any other text** to that same message → the video is **deleted right after transcribing**
-  (transcript + link stay), and that extra text is saved as a **personal note**.
+  (transcript + link stay), and that extra text is saved as a **personal note**. For photo
+  posts/carousels the images are deleted after OCR the same way (`ocr.txt` + caption stay).
 - Add the standalone word **"save"** anywhere in that extra text → the video is **kept anyway**,
   and any remaining text (besides the word "save" itself) is still saved as the note. Use this when
   you want to both leave yourself a note *and* keep the clip — expected to be rare, so it's an

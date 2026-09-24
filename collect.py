@@ -458,12 +458,19 @@ def main() -> int:
                         (stage_dir / "ocr.txt").write_text(
                             "\n\n".join(blocks) + "\n", encoding="utf-8")
 
+                # Same keep/delete rule as videos, but an image whose OCR failed is kept - deleting
+                # it would leave nothing of its content behind.
+                deletable_images = [p for p, t in zip(post["image_paths"], ocr_texts)
+                                    if job["delete_video"] and not t.startswith("[OCR failed")]
+
                 lines = [
                     f"URL: {job['url']}",
                     f"PLATFORM: {post['platform']}",
                     f"RECEIVED: {dt.datetime.now().isoformat(timespec='seconds')}",
                     f"CONTENT: {n_img} image(s), {n_vid} video(s)",
                 ]
+                if n_img:
+                    lines.append(f"IMAGES: {'deleted-after-ocr' if deletable_images else 'keep'}")
                 if job["note"]:
                     lines.append(f"PERSONAL NOTE: {job['note']}")
                 (stage_dir / "source.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -475,6 +482,11 @@ def main() -> int:
                 final_name = build_final_name("", naming_source, fallback_id=stage_dir.name)
                 final_dir = unique_dest(stage_dir.parent, final_name)
                 stage_dir.rename(final_dir)
+                for img in deletable_images:
+                    try:
+                        (final_dir / img.name).unlink(missing_ok=True)
+                    except OSError as e:
+                        print(f"  (warning: couldn't delete {img.name}: {e})", flush=True)
                 if job["note"]:
                     personal_notes.append(f'{final_dir.name}: "{job["note"]}"')
             else:
