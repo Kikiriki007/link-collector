@@ -9,7 +9,8 @@ a personal, searchable archive of clips + text.
 Photo posts and carousels work too: images are downloaded directly and run through
 [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) to pull out any on-image text (the actual
 content of most infographic/tip-list posts, which the caption alone usually misses), alongside the
-post's own caption. No Whisper step for these - there's no audio.
+post's own caption. Any videos mixed into a carousel are downloaded and transcribed with Whisper
+like a normal clip.
 
 No AI/LLM step in the pipeline itself — it's a deterministic download-and-transcribe job. You don't
 need Claude or any API key besides your own Telegram bot token.
@@ -50,6 +51,7 @@ Video Transcripts/
 
     your-exam-is-7-days-away-stop/      # a photo post/carousel instead
       image_01.jpg ... image_09.jpg     # every image in the post (unless flagged for deletion)
+      video_02.mp4 + video_02.txt/...   # a video inside the carousel, numbered by its position
       caption.txt                       # the post's own caption
       ocr.txt                           # on-image text, one labeled block per image
       source.txt                        # URL, platform, timestamp, item counts, note if any
@@ -70,7 +72,9 @@ behind but a near-empty transcript, even if the caption itself had the real cont
 - Send **just the bare link** → the video is **kept**, no note.
 - Add **any other text** to that same message → the video is **deleted right after transcribing**
   (transcript + link stay), and that extra text is saved as a **personal note**. For photo
-  posts/carousels the images are deleted after OCR the same way (`ocr.txt` + caption stay).
+  posts/carousels the images (after OCR) and any carousel videos (after transcribing) are deleted
+  the same way - `ocr.txt`, transcripts and caption stay. Anything whose OCR/transcription failed
+  is kept.
 - Add the standalone word **"save"** anywhere in that extra text → the video is **kept anyway**,
   and any remaining text (besides the word "save" itself) is still saved as the note. Use this when
   you want to both leave yourself a note *and* keep the clip — expected to be rare, so it's an

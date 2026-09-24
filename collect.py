@@ -171,7 +171,8 @@ def download_post(url: str, dest_dir: Path, cfg: dict) -> dict:
     carousel item. Images are fetched directly (they're plain signed CDN URLs, no yt-dlp
     downloader needed); any video mixed into a carousel goes through yt-dlp's own downloader
     so DASH/merge handling stays correct. Returns
-    {'platform', 'caption', 'image_paths': [Path,...], 'video_paths': [Path,...]}.
+    {'platform', 'caption', 'image_paths': [Path,...], 'video_paths': [Path,...],
+     'video_errors': [(item_index, message), ...]}.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     base_opts = {"quiet": True, "no_warnings": True, **_yt_dlp_auth_opts(cfg)}
@@ -183,19 +184,23 @@ def download_post(url: str, dest_dir: Path, cfg: dict) -> dict:
     platform = info.get("extractor_key") or info.get("extractor") or "unknown"
     caption = (info.get("description") or "").strip()
 
-    image_paths, video_paths = [], []
+    image_paths, video_paths, video_errors = [], [], []
     for idx, entry in enumerate(entries, 1):
         if entry.get("formats"):
+            # a failed video item is reported back rather than failing the whole post
             try:
                 v_opts = {**base_opts, "outtmpl": str(dest_dir / f"video_{idx:02d}.%(ext)s"),
                           "merge_output_format": "mp4"}
                 with yt_dlp.YoutubeDL(v_opts) as vydl:
                     vydl.process_ie_result(dict(entry), download=True)
-                found = sorted(dest_dir.glob(f"video_{idx:02d}.*"))
+                found = sorted(p for p in dest_dir.glob(f"video_{idx:02d}.*")
+                               if p.suffix.lower() in VIDEO_EXTS)
                 if found:
                     video_paths.append(found[0])
-            except Exception:
-                pass  # skip this one item rather than failing the whole post
+                else:
+                    video_errors.append((idx, "no video file produced"))
+            except Exception as e:
+                video_errors.append((idx, str(e)))
             continue
 
         thumbs = entry.get("thumbnails") or []
@@ -209,10 +214,12 @@ def download_post(url: str, dest_dir: Path, cfg: dict) -> dict:
         image_paths.append(img_path)
 
     if not image_paths and not video_paths:
-        raise ValueError("no downloadable image or video items found in this post")
+        detail = "; ".join(f"item {i}: {m}" for i, m in video_errors)
+        raise ValueError("no downloadable image or video items found in this post"
+                         + (f" ({detail})" if detail else ""))
 
-    return {"platform": platform, "caption": caption,
-            "image_paths": image_paths, "video_paths": video_paths}
+    return {"platform": platform, "caption": caption, "image_paths": image_paths,
+            "video_paths": video_paths, "video_errors": video_errors}
 
 
 # --- OCR (for image posts/carousels - on-image text the caption alone misses) ---
@@ -342,6 +349,30 @@ def unique_dest(parent: Path, name: str) -> Path:
     return candidate
 
 
+# --- transcription ---------------------------------------------------------------
+def load_whisper(cfg: dict):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_name = cfg.get("whisper_model", "small")
+    print(f"loading Whisper model '{model_name}' ({device})...", flush=True)
+    return whisper.load_model(model_name, device=device), device
+
+
+def transcribe_video(model, device: str, video_path: Path, out_dir: Path,
+                     delete_video: bool) -> dict:
+    """Transcribes video_path and writes the transcript files into out_dir, named after the
+    video's own stem (video.txt, video_02.srt, ...). Returns Whisper's result dict."""
+    result = model.transcribe(str(video_path), fp16=(device == "cuda"), verbose=False)
+    opts = {"max_line_width": 80, "max_line_count": 2}
+    if delete_video:
+        # no video to sync captions to - keep just the plain-text transcript
+        get_writer("txt", str(out_dir))(result, str(video_path), opts)
+    else:
+        get_writer("all", str(out_dir))(result, str(video_path), opts)
+        (out_dir / f"{video_path.stem}.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
 # --- main -------------------------------------------------------------------
 def main() -> int:
     cfg = load_config()
@@ -413,6 +444,9 @@ def main() -> int:
     flagged_counts = []
     staging_dirs = []
     ocr_engine = None  # lazy: loaded on first image post this run, reused after that
+    whisper_bundle = None  # lazy (model, device): loaded on first video this run, reused after
+    flag_keywords = cfg.get("flag_keywords", DEFAULT_FLAG_KEYWORDS)
+    flag_keyword_re = build_flag_keyword_re(flag_keywords)
 
     try:
         for i, job in enumerate(jobs, 1):
@@ -438,12 +472,16 @@ def main() -> int:
                     continue
 
             if post is not None:
-                # Photo post/carousel - no audio to transcribe, so finalize right here rather
-                # than deferring to the Whisper phase below. The caption stands in for a
-                # transcript, both for naming and as the saved text.
+                # Photo post/carousel - finalized right here rather than deferring to the staging
+                # phase below: images go through OCR, any videos mixed in are transcribed inline.
+                # The caption stands in for a transcript when naming and as the saved text.
                 caption = post["caption"]
                 n_img, n_vid = len(post["image_paths"]), len(post["video_paths"])
                 print(f"  -> {n_img} image(s), {n_vid} video(s)", flush=True)
+                for idx, err in post["video_errors"]:
+                    print(f"  carousel video #{idx} failed to download: {err}", flush=True)
+                    download_failures.append((f"{job['url']} (carousel video #{idx})",
+                                              classify_error(err)))
 
                 ocr_texts = []
                 if post["image_paths"]:
@@ -458,10 +496,26 @@ def main() -> int:
                         (stage_dir / "ocr.txt").write_text(
                             "\n\n".join(blocks) + "\n", encoding="utf-8")
 
-                # Same keep/delete rule as videos, but an image whose OCR failed is kept - deleting
-                # it would leave nothing of its content behind.
+                transcripts = []  # (video_path, whisper result) for each video that transcribed ok
+                for vp in post["video_paths"]:
+                    print(f"  transcribing carousel video: {vp.name}", flush=True)
+                    try:
+                        if whisper_bundle is None:
+                            whisper_bundle = load_whisper(cfg)
+                        model, device = whisper_bundle
+                        transcripts.append(
+                            (vp, transcribe_video(model, device, vp, stage_dir, job["delete_video"])))
+                        transcribe_ok += 1
+                    except Exception as e:
+                        print(f"  TRANSCRIBE FAILED ({vp.name}): {e}", flush=True)
+                        transcribe_failures.append(
+                            (f"{job['url']} [{vp.name}]", f"transcription error: {e}"))
+
+                # Same keep/delete rule as single videos. Media whose text extraction failed (OCR
+                # error, transcription error) is kept - deleting it would leave nothing of it behind.
                 deletable_images = [p for p, t in zip(post["image_paths"], ocr_texts)
                                     if job["delete_video"] and not t.startswith("[OCR failed")]
+                deletable_videos = [vp for vp, _ in transcripts if job["delete_video"]]
 
                 lines = [
                     f"URL: {job['url']}",
@@ -471,6 +525,8 @@ def main() -> int:
                 ]
                 if n_img:
                     lines.append(f"IMAGES: {'deleted-after-ocr' if deletable_images else 'keep'}")
+                if n_vid:
+                    lines.append(f"VIDEO: {'deleted-after-transcribe' if deletable_videos else 'keep'}")
                 if job["note"]:
                     lines.append(f"PERSONAL NOTE: {job['note']}")
                 (stage_dir / "source.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -478,15 +534,29 @@ def main() -> int:
                     (stage_dir / "caption.txt").write_text(caption + "\n", encoding="utf-8")
 
                 plain_ocr = " ".join(t for t in ocr_texts if t and not t.startswith("[OCR failed"))
-                naming_source = caption if caption.strip() else plain_ocr
+                spoken = " ".join(r["text"].strip() for _, r in transcripts)
+                naming_source = next((s for s in (caption, plain_ocr, spoken) if s.strip()), "")
                 final_name = build_final_name("", naming_source, fallback_id=stage_dir.name)
                 final_dir = unique_dest(stage_dir.parent, final_name)
                 stage_dir.rename(final_dir)
-                for img in deletable_images:
+                for media in deletable_images + deletable_videos:
                     try:
-                        (final_dir / img.name).unlink(missing_ok=True)
+                        (final_dir / media.name).unlink(missing_ok=True)
                     except OSError as e:
-                        print(f"  (warning: couldn't delete {img.name}: {e})", flush=True)
+                        print(f"  (warning: couldn't delete {media.name}: {e})", flush=True)
+
+                moments = []
+                for vp, result in transcripts:
+                    for start, word, text in find_flagged_moments(result.get("segments", []),
+                                                                   flag_keyword_re):
+                        moments.append((start, word,
+                                        f"{vp.name}: {text}" if len(transcripts) > 1 else text))
+                if moments:
+                    write_flagged_moments(final_dir, moments, flag_keywords)
+                    print(f"  -> {len(moments)} flagged moment(s) "
+                          f"(screenshot/screengrab mentions)", flush=True)
+                    flagged_counts.append(f"{final_dir.name}: {len(moments)} moment(s)")
+
                 if job["note"]:
                     personal_notes.append(f'{final_dir.name}: "{job["note"]}"')
             else:
@@ -516,29 +586,17 @@ def main() -> int:
         )
 
         if staging_dirs:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model_name = cfg.get("whisper_model", "small")
-            print(f"loading Whisper model '{model_name}' ({device})...", flush=True)
-            model = whisper.load_model(model_name, device=device)
-            flag_keywords = cfg.get("flag_keywords", DEFAULT_FLAG_KEYWORDS)
-            flag_keyword_re = build_flag_keyword_re(flag_keywords)
+            if whisper_bundle is None:
+                whisper_bundle = load_whisper(cfg)
+            model, device = whisper_bundle
 
             for i, stage_dir in enumerate(staging_dirs, 1):
                 try:
                     meta = read_source_txt(stage_dir)
                     video_path = find_video_file(stage_dir)
                     print(f"[{i}/{len(staging_dirs)}] transcribing: {video_path.name}", flush=True)
-                    result = model.transcribe(str(video_path), fp16=(device == "cuda"),
-                                               verbose=False)
-                    if meta["delete_video"]:
-                        # no video to sync captions to - keep just the plain-text transcript
-                        writer = get_writer("txt", str(stage_dir))
-                        writer(result, str(video_path), {"max_line_width": 80, "max_line_count": 2})
-                    else:
-                        writers = get_writer("all", str(stage_dir))
-                        writers(result, str(video_path), {"max_line_width": 80, "max_line_count": 2})
-                        (stage_dir / "video.json").write_text(
-                            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                    result = transcribe_video(model, device, video_path, stage_dir,
+                                              meta["delete_video"])
 
                     final_name = build_final_name(meta["title"], result["text"],
                                                    fallback_id=stage_dir.name)

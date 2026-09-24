@@ -54,8 +54,12 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    either a direct image fetch (CDN thumbnail URL) or a yt-dlp video download for any video mixed
    into the carousel. Photo posts are *finalized immediately* in this phase (OCR via PaddleOCR,
    `source.txt`, `caption.txt`, rename out of `_staging_*`) since there's no Whisper step for them.
-   The same `delete_video` flag applies: images are unlinked after OCR (except any whose OCR failed);
-   videos mixed into a carousel are never transcribed, so they're always kept.
+   Videos mixed into a carousel (`video_NN.*`, NN = position in the post) are transcribed inline here
+   too, via the same lazily-loaded Whisper model and `transcribe_video` helper the staging phase
+   uses - they never enter `_staging_*` resume flow, so an interrupted carousel job is simply redone
+   from scratch next run. The same `delete_video` flag applies to carousel media: images are
+   unlinked after OCR and videos after transcribing, except any item whose OCR/transcription failed.
+   Failed carousel video downloads are reported via `video_errors` into `download_failures`.
    Video jobs instead write `source.txt`/`caption.txt` into a `_staging_<update_id>` folder and defer
    transcription to phase 3.
 
