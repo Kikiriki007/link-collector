@@ -137,10 +137,25 @@ def looks_like_image_post(err_text: str) -> bool:
     return "no video formats found" in err_text.lower()
 
 
+LONG_FORM_MIN_SECONDS = 180  # yt-dlp's "duration" field, in seconds
+
+
 def download_video(url: str, dest_dir: Path, cfg: dict) -> dict:
     dest_dir.mkdir(parents=True, exist_ok=True)
+    auth_opts = _yt_dlp_auth_opts(cfg)
+
+    # Cheap pre-flight (process=False skips format-list resolution, the expensive part for
+    # YouTube) just to read duration/extractor_key - long-form YouTube can run well past an
+    # hour, where 1080p adds a lot of disk cost for marginal gain in this archive's use case
+    # (search + rewatch). Shorts and every other platform keep the higher cap.
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **auth_opts}) as probe:
+        preinfo = probe.extract_info(url, download=False, process=False)
+    is_long_youtube = (preinfo.get("extractor_key") == "Youtube"
+                       and (preinfo.get("duration") or 0) > LONG_FORM_MIN_SECONDS)
+    max_height = 720 if is_long_youtube else 1080
+
     ydl_opts = {
-        "format": "bv*[height<=1080]+ba/b[height<=1080]/best",
+        "format": f"bv*[height<={max_height}]+ba/b[height<={max_height}]/best",
         "merge_output_format": "mp4",
         "outtmpl": str(dest_dir / "video.%(ext)s"),
         "quiet": False,
@@ -149,7 +164,7 @@ def download_video(url: str, dest_dir: Path, cfg: dict) -> dict:
         # trusts "deno" for this by default. Add "node" as a fallback since that's commonly
         # already installed (and harmless to list even if neither is present).
         "js_runtimes": {"deno": {}, "node": {}},
-        **_yt_dlp_auth_opts(cfg),
+        **auth_opts,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=True)

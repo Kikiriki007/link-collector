@@ -15,6 +15,10 @@ like a normal clip.
 No AI/LLM step in the pipeline itself — it's a deterministic download-and-transcribe job. You don't
 need Claude or any API key besides your own Telegram bot token.
 
+Videos download at up to 1080p, except long-form YouTube (over 3 minutes) which caps at 720p —
+those can run well past an hour, where the disk cost of 1080p isn't worth it for an archive meant
+for search and rewatch, not pixel-peeping.
+
 > Prefer to have an AI walk you through setup instead of following the steps below by hand? Open
 > this folder in Claude Code (or hand it these instructions) and say "set up link-collector for me."
 > Everything below is also written to be followed manually, with no AI involved at all.

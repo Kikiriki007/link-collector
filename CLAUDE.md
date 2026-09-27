@@ -48,7 +48,11 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    prior run. `last_update_id` is advanced and saved after every message/job, one at a time, so a
    crash mid-batch never reprocesses or double-processes anything already handled.
 
-2. **Download phase**: for each job, `download_video` (yt-dlp, video path) is tried first. If yt-dlp
+2. **Download phase**: for each job, `download_video` (yt-dlp, video path) is tried first. It runs a
+   cheap `process=False` pre-flight (skips format-list resolution, the expensive part on YouTube) to
+   read `duration`/`extractor_key` before choosing the real format string: long-form YouTube
+   (>`LONG_FORM_MIN_SECONDS`) is capped at 720p, everything else (Shorts, other platforms) at 1080p.
+   If yt-dlp
    reports "no video formats found", it's treated as a photo post/carousel and retried via
    `download_post`, which extracts info without downloading, then pulls each carousel entry as
    either a direct image fetch (CDN thumbnail URL) or a yt-dlp video download for any video mixed
