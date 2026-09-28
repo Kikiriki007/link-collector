@@ -38,7 +38,8 @@ for search and rewatch, not pixel-peeping.
   transcribes faster, but that's optional.
 - The daily-automation piece (`setup_task.ps1`, Windows Task Scheduler) is **Windows-only**;
   `collect.py` itself is plain Python and runs fine by hand on macOS/Linux, or via cron there.
-- ~5 minutes for manual setup, see below 
+- **~5 minutes for manual setup** - see Setup below.
+
 ## What you get
 
 For every link you send, once processed:
