@@ -152,9 +152,13 @@ def looks_like_image_post(err_text: str) -> bool:
 LONG_FORM_MIN_SECONDS = 180  # yt-dlp's "duration" field, in seconds
 
 # Substrings of known-transient yt-dlp/YouTube errors worth a retry rather than an immediate
-# failure - e.g. "The page needs to be reloaded" is a documented, intermittent YouTube-side hiccup
-# unrelated to the video itself (a plain re-extraction a few seconds later typically succeeds).
-TRANSIENT_ERROR_SUBSTRINGS = ("needs to be reloaded",)
+# failure - a plain re-extraction typically succeeds. "needs to be reloaded" is a documented,
+# intermittent YouTube-side hiccup unrelated to the video itself. "http error 403" showed up
+# separately on the same real video once cookies were dropped for the reload error above - it
+# happens at the actual data-fetch stage, after a format was already successfully selected, so
+# it's a signed-CDN-URL/session mismatch rather than a real permission error (which surfaces
+# earlier, during extraction) - re-extracting gets a fresh URL and has succeeded every time so far.
+TRANSIENT_ERROR_SUBSTRINGS = ("needs to be reloaded", "http error 403")
 
 
 RETRY_BACKOFF_SECONDS = (0, 5, 15, 30)

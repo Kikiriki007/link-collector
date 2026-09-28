@@ -63,15 +63,18 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    cheap `process=False` pre-flight (skips format-list resolution, the expensive part on YouTube) to
    read `duration`/`extractor_key` before choosing the real format string: long-form YouTube
    (>`LONG_FORM_MIN_SECONDS`) is capped at 720p, everything else (Shorts, other platforms) at 1080p.
-   The whole probe+download is retried (`TRANSIENT_ERROR_SUBSTRINGS`, currently just YouTube's
-   "needs to be reloaded") over `RETRY_BACKOFF_SECONDS`, dropping cookies after the first attempt.
+   The whole probe+download is retried (`TRANSIENT_ERROR_SUBSTRINGS`: "needs to be reloaded" and
+   "http error 403") over `RETRY_BACKOFF_SECONDS`, dropping cookies after the first attempt.
    Root-caused by hand on a real ~20h video that failed 100% of the time with `cookies_from_browser`
    configured and 0% of the time without it, same video, same moment: `cookiesfrombrowser` reads the
    browser's live cookie database directly, and doing that while the browser is actually open and
    writing to it can return a stale/locked snapshot that makes YouTube reject the session - not a
    generic hiccup and not time-based (a longer wait alone never fixed it), so dropping cookies on
    retry is the actual fix, not just backoff. If the content genuinely needs cookies (private/
-   login-walled), dropping them just surfaces that as its own, correctly-classified failure. Any other
+   login-walled), dropping them just surfaces that as its own, correctly-classified failure.
+   "http error 403" showed up separately on the same video, at the actual data-fetch stage after a
+   format was already selected (a signed-CDN-URL/session mismatch, not a real permission error -
+   those surface earlier, during extraction) - re-extracting on retry gets a fresh URL. Any other
    error fails on the first attempt. If yt-dlp
    reports "no video formats found", it's treated as a photo post/carousel and retried via
    `download_post`, which extracts info without downloading, then pulls each carousel entry as
