@@ -9,8 +9,9 @@ yt-dlp, transcribes it with Whisper, and files the pair into a readable folder u
 Message rule: send *only* the bare link -> the video is kept. Add any other text to the message ->
 that text becomes a PERSONAL NOTE (saved in that clip's source.txt and echoed into log.txt) *and*
 signals "delete the video after transcribing" (transcript + note stay either way). Send just the
-letter "c" -> cancels every link queued in this batch (nothing downloaded, nothing re-queued next
-run either) - a remote way to retract a just-sent link without console access.
+letter "c" -> cancels every link sent *before* it (nothing downloaded, nothing re-queued next run
+either) - a remote way to retract a just-sent link without console access. Links sent after the "c"
+are unaffected, even if they all arrive in the same batch (e.g. after a skipped/delayed run).
 
 Usage:
     python collect.py
@@ -414,16 +415,18 @@ def main() -> int:
 
     jobs = []
     skipped = []  # descriptions of messages with no extractable URL - see log for why this matters
-    cancel_seen = False
+    cancelled_count = 0
     for upd in updates:
         update_id = upd["update_id"]
         msg = upd.get("message") or upd.get("channel_post") or {}
         text = msg.get("text") or msg.get("caption") or ""
         if text.strip().lower() == "c":
             # Bare "c", nothing else - a remote cancel signal (e.g. you sent a link by mistake
-            # and want to retract it before it's processed). Consumed like any other message so
-            # it's never seen again; the whole batch's queued jobs get discarded further down.
-            cancel_seen = True
+            # and want to retract it before it's processed). Only discards jobs queued *earlier*
+            # in this same fetched batch - anything sent after the "c" is unaffected and processed
+            # normally below, even though it's all one batch by the time a run picks it up.
+            cancelled_count += len(jobs)
+            jobs = []
             cfg["last_update_id"] = update_id
             save_config(cfg)
             continue
@@ -437,18 +440,10 @@ def main() -> int:
             continue
         jobs.append({"update_id": update_id, "url": url, "note": note, "delete_video": delete_video})
 
-    cancelled_count = 0
+    cancel_seen = cancelled_count > 0
     if cancel_seen:
-        cancelled_count = len(jobs)
-        print(f"Cancel ('c') received - discarding {cancelled_count} queued link(s) from this "
-              f"batch, nothing downloaded.", flush=True)
-        jobs = []
-        # Discarded jobs never ran the per-job save below (that only happens once a job is
-        # actually downloaded), so force last_update_id past this whole fetched batch here -
-        # otherwise a cancelled link would resurface and get re-queued next run.
-        if updates:
-            cfg["last_update_id"] = updates[-1]["update_id"]
-            save_config(cfg)
+        print(f"Cancel ('c') received - discarding {cancelled_count} queued link(s) sent before "
+              f"it, nothing downloaded.", flush=True)
 
     today_dir = output_root / dt.date.today().isoformat()
     download_ok = 0

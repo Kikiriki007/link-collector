@@ -43,10 +43,14 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
 1. **Fetch Telegram updates** (`tg_get_updates`) since `last_update_id`. Each message is resolved to
    a job via `find_message_url` / `extract_url_and_note`, which also decides `delete_video` (bare
    link = keep; link + any other text = delete-after-transcribe; the standalone word "save" in that
-   text overrides delete back to keep). A bare `"c"` message cancels every job queued *in that same
-   batch* (see `cancel_seen` handling) - it does not affect anything already mid-download from a
-   prior run. `last_update_id` is advanced and saved after every message/job, one at a time, so a
-   crash mid-batch never reprocesses or double-processes anything already handled.
+   text overrides delete back to keep). A bare `"c"` message discards every job accumulated *so far
+   in the loop* (`cancelled_count += len(jobs); jobs = []`) and keeps going - it's order-aware within
+   the batch, not a whole-batch wipe: links appearing after the "c" in the same fetch are unaffected,
+   since Telegram can hand back several unprocessed messages in one `getUpdates` call whenever a run
+   was skipped/delayed, so "before/after the c" is about message order, not which run sent them. It
+   also never touches anything already mid-download from a prior run. `last_update_id` is advanced
+   and saved after every message/job, one at a time, so a crash mid-batch never reprocesses or
+   double-processes anything already handled.
 
 2. **Download phase**: for each job, `download_video` (yt-dlp, video path) is tried first. It runs a
    cheap `process=False` pre-flight (skips format-list resolution, the expensive part on YouTube) to

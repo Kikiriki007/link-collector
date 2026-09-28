@@ -93,14 +93,15 @@ trigger the normal delete-after-transcribe behavior.
 
 ### Changed your mind? Send "c"
 
-Send a message that's **just the letter c** (nothing else) to cancel — every link waiting to be
-processed in that batch (including ones sent earlier the same run, e.g. a link you sent by mistake
-right before) gets discarded and marked as seen, so none of them get downloaded and none of them
-come back on the next run either. Handy since this is meant to run unattended (the daily 6am task) -
-you don't need console access to call something off, just send "c" from your phone before it runs.
+Send a message that's **just the letter c** (nothing else) to cancel every link you sent **before**
+it — gets discarded and marked as seen, so none of them get downloaded and none of them come back
+on the next run either. Handy since this is meant to run unattended (the daily 6am task) - you
+don't need console access to call something off, just send "c" from your phone before it runs.
 You'll still get a Telegram confirmation of what was discarded.
 
-It only cancels newly-queued links, not anything already mid-download from a previous run.
+Only affects links sent earlier - anything you send **after** the "c" (even in the same run, if
+it hasn't triggered yet) is unaffected and processed normally. It also doesn't touch anything
+already mid-download from a previous run.
 
 ## Flagged moments — catching what's on screen, not just what's said
 
