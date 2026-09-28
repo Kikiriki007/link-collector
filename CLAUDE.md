@@ -64,8 +64,11 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    read `duration`/`extractor_key` before choosing the real format string: long-form YouTube
    (>`LONG_FORM_MIN_SECONDS`) is capped at 720p, everything else (Shorts, other platforms) at 1080p.
    The whole probe+download is retried (`TRANSIENT_ERROR_SUBSTRINGS`, currently just YouTube's
-   intermittent "needs to be reloaded") up to 3 attempts with a short sleep - a known transient
-   hiccup, not something specific to a video, so an immediate re-extraction is the fix. Any other
+   intermittent "needs to be reloaded") up to 5 attempts with exponential backoff (10s/20s/40s/80s)
+   - confirmed on a real ~20h video that failed 3/3 tries in production with only a flat 5s gap, yet
+   downloaded fine both immediately before and after outside the script, so the block/hiccup this is
+   working around can outlast a short retry window; the longer backoff is a direct response to that.
+   It's a known transient hiccup, not something specific to a video. Any other
    error fails on the first attempt. If yt-dlp
    reports "no video formats found", it's treated as a photo post/carousel and retried via
    `download_post`, which extracts info without downloading, then pulls each carousel entry as

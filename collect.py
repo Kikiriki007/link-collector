@@ -160,7 +160,7 @@ TRANSIENT_ERROR_SUBSTRINGS = ("needs to be reloaded",)
 def download_video(url: str, dest_dir: Path, cfg: dict) -> dict:
     dest_dir.mkdir(parents=True, exist_ok=True)
     auth_opts = _yt_dlp_auth_opts(cfg)
-    attempts = 3
+    attempts = 5
 
     for attempt in range(1, attempts + 1):
         try:
@@ -192,8 +192,10 @@ def download_video(url: str, dest_dir: Path, cfg: dict) -> dict:
             transient = any(s in str(e).lower() for s in TRANSIENT_ERROR_SUBSTRINGS)
             if not transient or attempt == attempts:
                 raise
-            print(f"  transient error, retrying ({attempt}/{attempts}): {e}", flush=True)
-            time.sleep(5)
+            backoff = 10 * (2 ** (attempt - 1))  # 10s, 20s, 40s, 80s
+            print(f"  transient error, retrying in {backoff}s ({attempt}/{attempts}): {e}",
+                  flush=True)
+            time.sleep(backoff)
 
 
 def _yt_dlp_auth_opts(cfg: dict) -> dict:
