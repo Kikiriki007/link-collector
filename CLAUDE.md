@@ -40,23 +40,33 @@ against a real link sent to the bot (or a leftover `_staging_*` folder for the r
 `collect.py` runs as a single pass, structured in phases that all share the *same* `config.json`
 state (`last_update_id`), which is what makes manual runs and the scheduled task safe to interleave:
 
-1. **Fetch Telegram updates** (`tg_get_updates`) since `last_update_id`. Each message is resolved to
-   a job via `find_message_url` / `extract_url_and_note`, which also decides `delete_video` (bare
-   link = keep; link + any other text = delete-after-transcribe; the standalone word "save" in that
-   text overrides delete back to keep). A bare `"c"` message discards every job accumulated *so far
-   in the loop* (`cancelled_count += len(jobs); jobs = []`) and keeps going - it's order-aware within
-   the batch, not a whole-batch wipe: links appearing after the "c" in the same fetch are unaffected,
-   since Telegram can hand back several unprocessed messages in one `getUpdates` call whenever a run
-   was skipped/delayed, so "before/after the c" is about message order, not which run sent them. It
-   also never touches anything already mid-download from a prior run. `last_update_id` is advanced
-   and saved after every message/job, one at a time, so a crash mid-batch never reprocesses or
-   double-processes anything already handled.
+1. **Fetch Telegram updates** (`tg_get_updates`) since `last_update_id`. An `edited_message`/
+   `edited_channel_post` update (Telegram sends these for actual edits, but also automatically once
+   a link preview attaches to an already-sent URL - no user action needed) is consumed and ignored:
+   the original send already produced a job or got logged, so reprocessing it would risk a duplicate
+   download. Each remaining message is resolved to a job via `find_message_url` /
+   `extract_url_and_note`, which also decides `delete_video` (bare link = keep; link + any other
+   text = delete-after-transcribe; the standalone word "save" in that text overrides delete back to
+   keep). A bare `"c"` message discards every job accumulated *so far in the loop*
+   (`cancelled_count += len(jobs); jobs = []`) and keeps going - it's order-aware within the batch,
+   not a whole-batch wipe: links appearing after the "c" in the same fetch are unaffected, since
+   Telegram can hand back several unprocessed messages in one `getUpdates` call whenever a run was
+   skipped/delayed, so "before/after the c" is about message order, not which run sent them. It also
+   never touches anything already mid-download from a prior run. `last_update_id` is advanced via
+   `advance_last_update_id` (a `max()`, never regresses) after every message/job, one at a time -
+   jobs are collected in this pass but downloaded in a later, separate one, so a plain assignment
+   there could move `last_update_id` backwards past a skip/cancel/edit already resolved (and saved)
+   later in the same original fetch; `max()` keeps the crash-safety invariant that a mid-batch crash
+   never reprocesses or double-processes anything already handled.
 
 2. **Download phase**: for each job, `download_video` (yt-dlp, video path) is tried first. It runs a
    cheap `process=False` pre-flight (skips format-list resolution, the expensive part on YouTube) to
    read `duration`/`extractor_key` before choosing the real format string: long-form YouTube
    (>`LONG_FORM_MIN_SECONDS`) is capped at 720p, everything else (Shorts, other platforms) at 1080p.
-   If yt-dlp
+   The whole probe+download is retried (`TRANSIENT_ERROR_SUBSTRINGS`, currently just YouTube's
+   intermittent "needs to be reloaded") up to 3 attempts with a short sleep - a known transient
+   hiccup, not something specific to a video, so an immediate re-extraction is the fix. Any other
+   error fails on the first attempt. If yt-dlp
    reports "no video formats found", it's treated as a photo post/carousel and retried via
    `download_post`, which extracts info without downloading, then pulls each carousel entry as
    either a direct image fetch (CDN thumbnail URL) or a yt-dlp video download for any video mixed

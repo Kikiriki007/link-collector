@@ -24,6 +24,7 @@ import json
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -60,6 +61,16 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def advance_last_update_id(cfg: dict, update_id: int) -> None:
+    """Bumps and saves last_update_id, never letting it regress. Jobs are collected in one pass
+    but downloaded/transcribed in later, separate passes (possibly out of update_id order relative
+    to skipped/cancelled/edited messages resolved immediately in the first pass) - a plain
+    assignment here could otherwise move last_update_id backwards and cause already-handled
+    messages to be re-fetched and re-logged (though not re-downloaded) on the next run."""
+    cfg["last_update_id"] = max(cfg.get("last_update_id", 0), update_id)
+    save_config(cfg)
 
 
 # --- telegram -------------------------------------------------------------------
@@ -140,35 +151,49 @@ def looks_like_image_post(err_text: str) -> bool:
 
 LONG_FORM_MIN_SECONDS = 180  # yt-dlp's "duration" field, in seconds
 
+# Substrings of known-transient yt-dlp/YouTube errors worth a retry rather than an immediate
+# failure - e.g. "The page needs to be reloaded" is a documented, intermittent YouTube-side hiccup
+# unrelated to the video itself (a plain re-extraction a few seconds later typically succeeds).
+TRANSIENT_ERROR_SUBSTRINGS = ("needs to be reloaded",)
+
 
 def download_video(url: str, dest_dir: Path, cfg: dict) -> dict:
     dest_dir.mkdir(parents=True, exist_ok=True)
     auth_opts = _yt_dlp_auth_opts(cfg)
+    attempts = 3
 
-    # Cheap pre-flight (process=False skips format-list resolution, the expensive part for
-    # YouTube) just to read duration/extractor_key - long-form YouTube can run well past an
-    # hour, where 1080p adds a lot of disk cost for marginal gain in this archive's use case
-    # (search + rewatch). Shorts and every other platform keep the higher cap.
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **auth_opts}) as probe:
-        preinfo = probe.extract_info(url, download=False, process=False)
-    is_long_youtube = (preinfo.get("extractor_key") == "Youtube"
-                       and (preinfo.get("duration") or 0) > LONG_FORM_MIN_SECONDS)
-    max_height = 720 if is_long_youtube else 1080
+    for attempt in range(1, attempts + 1):
+        try:
+            # Cheap pre-flight (process=False skips format-list resolution, the expensive part
+            # for YouTube) just to read duration/extractor_key - long-form YouTube can run well
+            # past an hour, where 1080p adds a lot of disk cost for marginal gain in this
+            # archive's use case (search + rewatch). Shorts and other platforms keep the higher cap.
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **auth_opts}) as probe:
+                preinfo = probe.extract_info(url, download=False, process=False)
+            is_long_youtube = (preinfo.get("extractor_key") == "Youtube"
+                               and (preinfo.get("duration") or 0) > LONG_FORM_MIN_SECONDS)
+            max_height = 720 if is_long_youtube else 1080
 
-    ydl_opts = {
-        "format": f"bv*[height<={max_height}]+ba/b[height<={max_height}]/best",
-        "merge_output_format": "mp4",
-        "outtmpl": str(dest_dir / "video.%(ext)s"),
-        "quiet": False,
-        "retries": 2,
-        # YouTube requires solving a JS-obfuscated "n" parameter for some formats; yt-dlp only
-        # trusts "deno" for this by default. Add "node" as a fallback since that's commonly
-        # already installed (and harmless to list even if neither is present).
-        "js_runtimes": {"deno": {}, "node": {}},
-        **auth_opts,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=True)
+            ydl_opts = {
+                "format": f"bv*[height<={max_height}]+ba/b[height<={max_height}]/best",
+                "merge_output_format": "mp4",
+                "outtmpl": str(dest_dir / "video.%(ext)s"),
+                "quiet": False,
+                "retries": 2,
+                # YouTube requires solving a JS-obfuscated "n" parameter for some formats; yt-dlp
+                # only trusts "deno" for this by default. Add "node" as a fallback since that's
+                # commonly already installed (and harmless to list even if neither is present).
+                "js_runtimes": {"deno": {}, "node": {}},
+                **auth_opts,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        except Exception as e:
+            transient = any(s in str(e).lower() for s in TRANSIENT_ERROR_SUBSTRINGS)
+            if not transient or attempt == attempts:
+                raise
+            print(f"  transient error, retrying ({attempt}/{attempts}): {e}", flush=True)
+            time.sleep(5)
 
 
 def _yt_dlp_auth_opts(cfg: dict) -> dict:
@@ -418,6 +443,15 @@ def main() -> int:
     cancelled_count = 0
     for upd in updates:
         update_id = upd["update_id"]
+        if "edited_message" in upd or "edited_channel_post" in upd:
+            # Telegram sends one of these whenever a message is edited - including automatically,
+            # e.g. once a link preview attaches to an already-sent URL, with no user action at all.
+            # The original message/channel_post already produced a job (or got logged) when it was
+            # first sent, so this is consumed silently rather than reprocessed - re-running it would
+            # risk a duplicate download, and ignoring it outright showed up as spurious
+            # "[empty message]" skip noise (it has neither "message" nor "channel_post" key).
+            advance_last_update_id(cfg, update_id)
+            continue
         msg = upd.get("message") or upd.get("channel_post") or {}
         text = msg.get("text") or msg.get("caption") or ""
         if text.strip().lower() == "c":
@@ -427,16 +461,14 @@ def main() -> int:
             # normally below, even though it's all one batch by the time a run picks it up.
             cancelled_count += len(jobs)
             jobs = []
-            cfg["last_update_id"] = update_id
-            save_config(cfg)
+            advance_last_update_id(cfg, update_id)
             continue
         url, note, delete_video = find_message_url(msg)
         if not url:
             has_media = bool(msg.get("photo") or msg.get("video") or msg.get("document"))
             preview = text.strip()[:60] or ("[media, no text/caption]" if has_media else "[empty message]")
             skipped.append(preview)
-            cfg["last_update_id"] = update_id
-            save_config(cfg)
+            advance_last_update_id(cfg, update_id)
             continue
         jobs.append({"update_id": update_id, "url": url, "note": note, "delete_video": delete_video})
 
@@ -477,8 +509,7 @@ def main() -> int:
                     print(f"  FAILED ({reason}): {e}", flush=True)
                     download_failures.append((job["url"], reason))
                     shutil.rmtree(stage_dir, ignore_errors=True)
-                    cfg["last_update_id"] = job["update_id"]
-                    save_config(cfg)
+                    advance_last_update_id(cfg, job["update_id"])
                     continue
 
             if post is not None:
@@ -585,8 +616,7 @@ def main() -> int:
                     (stage_dir / "caption.txt").write_text(caption + "\n", encoding="utf-8")
 
             download_ok += 1
-            cfg["last_update_id"] = job["update_id"]
-            save_config(cfg)
+            advance_last_update_id(cfg, job["update_id"])
 
         # transcribe every staging dir that still has a video - this run's fresh downloads
         # AND any left over from a previous run that got interrupted before this phase.
