@@ -157,18 +157,31 @@ LONG_FORM_MIN_SECONDS = 180  # yt-dlp's "duration" field, in seconds
 TRANSIENT_ERROR_SUBSTRINGS = ("needs to be reloaded",)
 
 
+RETRY_BACKOFF_SECONDS = (0, 5, 15, 30)
+
+
 def download_video(url: str, dest_dir: Path, cfg: dict) -> dict:
     dest_dir.mkdir(parents=True, exist_ok=True)
     auth_opts = _yt_dlp_auth_opts(cfg)
-    attempts = 5
 
-    for attempt in range(1, attempts + 1):
+    for attempt, wait in enumerate(RETRY_BACKOFF_SECONDS, 1):
+        if wait:
+            time.sleep(wait)
+        # Cookies are dropped after the first attempt. Root-caused by hand: yt-dlp's
+        # cookiesfrombrowser reads the browser's live cookie database directly, and doing that
+        # while the browser is actually open and writing to it reproducibly returns a stale/locked
+        # snapshot that makes YouTube reject the session with "needs to be reloaded" - confirmed
+        # 3/3 failures with Firefox cookies vs 0/3 without, same video, same moment, cookies were
+        # the only variable. This isn't time-based (a longer wait alone never fixed it), so if the
+        # content genuinely needs cookies (private/login-walled), dropping them just surfaces that
+        # as its own, correctly-classified failure instead of retrying forever.
+        this_auth = auth_opts if attempt == 1 else {}
         try:
             # Cheap pre-flight (process=False skips format-list resolution, the expensive part
             # for YouTube) just to read duration/extractor_key - long-form YouTube can run well
             # past an hour, where 1080p adds a lot of disk cost for marginal gain in this
             # archive's use case (search + rewatch). Shorts and other platforms keep the higher cap.
-            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **auth_opts}) as probe:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **this_auth}) as probe:
                 preinfo = probe.extract_info(url, download=False, process=False)
             is_long_youtube = (preinfo.get("extractor_key") == "Youtube"
                                and (preinfo.get("duration") or 0) > LONG_FORM_MIN_SECONDS)
@@ -184,18 +197,17 @@ def download_video(url: str, dest_dir: Path, cfg: dict) -> dict:
                 # only trusts "deno" for this by default. Add "node" as a fallback since that's
                 # commonly already installed (and harmless to list even if neither is present).
                 "js_runtimes": {"deno": {}, "node": {}},
-                **auth_opts,
+                **this_auth,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=True)
         except Exception as e:
             transient = any(s in str(e).lower() for s in TRANSIENT_ERROR_SUBSTRINGS)
-            if not transient or attempt == attempts:
+            if not transient or attempt == len(RETRY_BACKOFF_SECONDS):
                 raise
-            backoff = 10 * (2 ** (attempt - 1))  # 10s, 20s, 40s, 80s
-            print(f"  transient error, retrying in {backoff}s ({attempt}/{attempts}): {e}",
-                  flush=True)
-            time.sleep(backoff)
+            dropped = " (dropping cookies)" if this_auth else ""
+            print(f"  transient error{dropped}, retrying "
+                  f"({attempt}/{len(RETRY_BACKOFF_SECONDS)}): {e}", flush=True)
 
 
 def _yt_dlp_auth_opts(cfg: dict) -> dict:
