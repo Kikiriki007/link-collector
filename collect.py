@@ -23,6 +23,7 @@ import datetime as dt
 import json
 import re
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -319,24 +320,71 @@ def build_flag_keyword_re(keywords: list) -> re.Pattern:
     return re.compile(r"\b(" + "|".join(escaped) + r")\b", re.I)
 
 
-def find_flagged_moments(segments: list, keyword_re: re.Pattern) -> list:
-    """Returns [(start_seconds, matched_word, segment_text), ...] for every segment whose text
-    matches one of the flag keywords - Whisper's segments carry real timestamps, unlike the
-    plain .txt output, so this is what lets you jump straight to the moment in the video."""
+def find_flagged_moments(video_path: Path, segments: list, keyword_re: re.Pattern) -> list:
+    """Returns a list of moment dicts ({video_path, start, word, text}) for every Whisper segment
+    whose text matches one of the flag keywords - segments carry real timestamps, unlike the plain
+    .txt output, which is what makes it possible to screenshot the exact moment later, not just log
+    that it happened."""
     moments = []
     for seg in segments:
         text = seg.get("text", "")
         m = keyword_re.search(text)
         if m:
-            moments.append((seg.get("start", 0.0), m.group(0), text.strip()))
+            moments.append({"video_path": video_path, "start": seg.get("start", 0.0),
+                             "word": m.group(0), "text": text.strip()})
     return moments
+
+
+SCREENSHOT_WIDTH = 960  # well below the source video - just enough to stay readable on review
+
+
+def capture_flagged_screenshots(moments: list, out_dir: Path) -> None:
+    """Grabs one frame per moment via ffmpeg and sets moment['screenshot'] to the saved Path (left
+    unset on failure). Uses input-side -ss (a fast keyframe seek) rather than seeking after -i -
+    frame-exact isn't the point here ("something was on screen around here"), and output-side
+    seeking would decode from the start of the file every time, which is far too slow on an
+    hours-long video. Called before the video is deleted - this is what keeps the moment's visual
+    content once the source file is gone."""
+    for idx, moment in enumerate(moments, 1):
+        ts = format_timestamp(moment["start"]).replace(":", "-")
+        out_path = out_dir / f"flagged_{idx:02d}_{ts}.jpg"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-ss", str(moment["start"]),
+                 "-i", str(moment["video_path"]), "-frames:v", "1",
+                 "-vf", f"scale={SCREENSHOT_WIDTH}:-2", str(out_path)],
+                check=True, capture_output=True,
+            )
+            moment["screenshot"] = out_path
+        except Exception as e:
+            print(f"  (warning: screenshot failed at {format_timestamp(moment['start'])}: {e})",
+                  flush=True)
+
+
+def ocr_flagged_screenshots(engine, moments: list) -> None:
+    """OCRs every moment that got a screenshot, setting moment['ocr_text']. Kept as a separate pass
+    from capture_flagged_screenshots so a failed screenshot doesn't block OCR of the ones that
+    succeeded, and so the (lazily-loaded) OCR engine is only touched when there's actually
+    something to read."""
+    shot_moments = [m for m in moments if m.get("screenshot")]
+    if not shot_moments:
+        return
+    texts = run_ocr(engine, [m["screenshot"] for m in shot_moments])
+    for m, text in zip(shot_moments, texts):
+        m["ocr_text"] = text
 
 
 def write_flagged_moments(stage_dir: Path, moments: list, keywords: list) -> None:
     lines = [f"{len(moments)} flagged moment(s) found (keywords: {', '.join(keywords)})", ""]
-    for start, word, text in moments:
-        lines.append(f"[{format_timestamp(start)}] (\"{word}\") {text}")
-    (stage_dir / "flagged_moments.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for m in moments:
+        lines.append(f"[{format_timestamp(m['start'])}] (\"{m['word']}\") {m['text']}")
+        if m.get("screenshot"):
+            lines.append(f"  screenshot: {m['screenshot'].name}")
+            ocr_text = (m.get("ocr_text") or "").strip()
+            lines.append(f"  on-screen text (OCR): {ocr_text}" if ocr_text
+                         else "  on-screen text (OCR): (none detected - check the screenshot by eye)")
+        lines.append("")
+    (stage_dir / "flagged_moments.txt").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 # --- source.txt (single source of truth for both fresh and resumed items) ------
@@ -598,18 +646,34 @@ def main() -> int:
                 final_name = build_final_name("", naming_source, fallback_id=stage_dir.name)
                 final_dir = unique_dest(stage_dir.parent, final_name)
                 stage_dir.rename(final_dir)
-                for media in deletable_images + deletable_videos:
-                    try:
-                        (final_dir / media.name).unlink(missing_ok=True)
-                    except OSError as e:
-                        print(f"  (warning: couldn't delete {media.name}: {e})", flush=True)
+
+                # re-point every path at final_dir now that the rename moved the files under it
+                transcripts = [(final_dir / vp.name, result) for vp, result in transcripts]
+                deletable_images = [final_dir / p.name for p in deletable_images]
+                deletable_videos = [final_dir / vp.name for vp in deletable_videos]
 
                 moments = []
                 for vp, result in transcripts:
-                    for start, word, text in find_flagged_moments(result.get("segments", []),
-                                                                   flag_keyword_re):
-                        moments.append((start, word,
-                                        f"{vp.name}: {text}" if len(transcripts) > 1 else text))
+                    for m in find_flagged_moments(vp, result.get("segments", []), flag_keyword_re):
+                        if len(transcripts) > 1:
+                            m["text"] = f"{vp.name}: {m['text']}"
+                        moments.append(m)
+
+                if moments and job["delete_video"]:
+                    # screenshot before the video goes - it's about to be unlinked below
+                    capture_flagged_screenshots(moments, final_dir)
+                    if any(m.get("screenshot") for m in moments):
+                        if ocr_engine is None:
+                            print("  loading PaddleOCR model...", flush=True)
+                            ocr_engine = load_ocr_engine()
+                        ocr_flagged_screenshots(ocr_engine, moments)
+
+                for media in deletable_images + deletable_videos:
+                    try:
+                        media.unlink(missing_ok=True)
+                    except OSError as e:
+                        print(f"  (warning: couldn't delete {media.name}: {e})", flush=True)
+
                 if moments:
                     write_flagged_moments(final_dir, moments, flag_keywords)
                     print(f"  -> {len(moments)} flagged moment(s) "
@@ -660,13 +724,24 @@ def main() -> int:
                                                    fallback_id=stage_dir.name)
                     final_dir = unique_dest(stage_dir.parent, final_name)
                     stage_dir.rename(final_dir)
+                    video_path = final_dir / video_path.name
+
+                    moments = find_flagged_moments(video_path, result.get("segments", []),
+                                                    flag_keyword_re)
+                    if moments and meta["delete_video"]:
+                        # screenshot before the video goes - it's about to be unlinked below
+                        capture_flagged_screenshots(moments, final_dir)
+                        if any(m.get("screenshot") for m in moments):
+                            if ocr_engine is None:
+                                print("  loading PaddleOCR model...", flush=True)
+                                ocr_engine = load_ocr_engine()
+                            ocr_flagged_screenshots(ocr_engine, moments)
 
                     if meta["delete_video"]:
                         for vf in final_dir.glob("video.*"):
                             if vf.suffix.lower() in VIDEO_EXTS:
                                 vf.unlink()
 
-                    moments = find_flagged_moments(result.get("segments", []), flag_keyword_re)
                     if moments:
                         write_flagged_moments(final_dir, moments, flag_keywords)
                         print(f"  -> {len(moments)} flagged moment(s) "
@@ -691,6 +766,17 @@ def main() -> int:
     if not jobs and not staging_dirs and not cancel_seen and not skipped:
         print("Nothing new.")
         return 0
+
+    # A run can take hours (a long video's download+transcribe) - anything sent to the bot in that
+    # window was never in this run's own `updates` fetch, so it's silently left unread rather than
+    # dropped (last_update_id was never advanced past it) and will be picked up automatically next
+    # run. This just peeks at the same offset again to report how many are waiting, purely
+    # informational - it doesn't process or acknowledge them, so nothing here can cause a miss.
+    late_updates = []
+    try:
+        late_updates = tg_get_updates(token, cfg.get("last_update_id", 0) + 1)
+    except requests.RequestException as e:
+        print(f"  (warning: couldn't check for late-arriving messages: {e})", flush=True)
 
     all_failures = download_failures + transcribe_failures
     timestamp = dt.datetime.now().isoformat(timespec="seconds")
@@ -717,6 +803,9 @@ def main() -> int:
         log_lines.append(f"skipped (no URL found, {len(skipped)}):")
         for preview in skipped:
             log_lines.append(f"  - {preview}")
+    if late_updates:
+        log_lines.append(f"{len(late_updates)} message(s) arrived after this run started fetching - "
+                          f"not yet processed, will be picked up next run")
     log_lines.append("")
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write("\n".join(log_lines) + "\n")
@@ -735,6 +824,9 @@ def main() -> int:
         summary_parts.append(summary)
     if skipped:
         summary_parts.append(f"{len(skipped)} message(s) had no extractable link, skipped - see log.txt.")
+    if late_updates:
+        summary_parts.append(f"{len(late_updates)} new message(s) came in while this was running, "
+                              f"will be picked up next run.")
     if summary_parts:
         tg_send_message(token, cfg["chat_id"], "\n\n".join(summary_parts))
 

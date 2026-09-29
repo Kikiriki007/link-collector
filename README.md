@@ -52,6 +52,7 @@ Video Transcripts/
       video.txt / .srt / .vtt / .json   # the transcript, several formats
       caption.txt                # the platform's own written caption/description, if it had one
       flagged_moments.txt        # only if the narrator said "screenshot"/etc - see below
+      flagged_01_00-46-25.jpg    # actual frame grabs for those moments (only if video was deleted)
       source.txt                 # the URL, platform, timestamp, and your personal note if any
 
     your-exam-is-7-days-away-stop/      # a photo post/carousel instead
@@ -104,6 +105,15 @@ Only affects links sent earlier - anything you send **after** the "c" (even in t
 it hasn't triggered yet) is unaffected and processed normally. It also doesn't touch anything
 already mid-download from a previous run.
 
+### Sending links while a run is already going
+
+A run only reads messages once, right at the start - anything you send after that (a long video's
+download + transcription can take hours) just sits unread; nothing is lost, it's picked up
+automatically the next time `collect.py` runs, same as if it arrived a second before that run
+started. The end-of-run summary tells you when this happened - "N new message(s) came in while
+this was running, will be picked up next run" - so you're not left wondering whether a link you
+sent mid-run actually got seen.
+
 ## Flagged moments — catching what's on screen, not just what's said
 
 Whisper only transcribes speech, so anything shown on screen but not narrated (a slide, a URL, a
@@ -112,13 +122,20 @@ analysis, every video's transcript is scanned for the narrator saying **"screens
 **"screengrab(s)"**, **"screen grab(s)"**, or **"screen shot(s)"** — a strong verbal cue that
 something on screen right then matters. Any match writes a `flagged_moments.txt` in that video's
 folder: a count, plus one `[MM:SS] ("matched word") <what was said>` line per hit, using Whisper's
-real segment timestamps so you can jump straight to that point in the video and grab it yourself.
-The Telegram summary and `log.txt` both mention when a video had flagged moments, so you don't have
-to open every folder to find out. Customize the keyword list via `"flag_keywords"` in `config.json`
-(defaults shown in `config.example.json`).
+real segment timestamps. The Telegram summary and `log.txt` both mention when a video had flagged
+moments, so you don't have to open every folder to find out. Customize the keyword list via
+`"flag_keywords"` in `config.json` (defaults shown in `config.example.json`).
 
-This is a manual-search aid, not automatic frame-grabbing — actually pulling a screenshot from the
-video at that timestamp would be the natural next step if this proves useful.
+**If the video is flagged for deletion**, each moment also gets an actual screenshot — a single
+frame grabbed with ffmpeg at that timestamp, downscaled to a small-but-readable size (960px wide),
+saved as `flagged_NN_HH-MM-SS.jpg` right next to `flagged_moments.txt`. Each screenshot is then run
+through the same PaddleOCR pass used for photo posts, and the extracted on-screen text is appended
+under that moment's entry in `flagged_moments.txt` — so what the video showed survives even after
+the video itself is gone. If ffmpeg can't grab a particular frame (e.g. a timestamp right at the
+end of the file), that one moment is just left as a text-only entry rather than failing the run.
+OCR isn't perfect, so the screenshot itself is always kept too, for a quick look by eye.
+Kept videos don't get this treatment — you still have the actual footage, so there's nothing to
+compensate for.
 
 ## Setup
 

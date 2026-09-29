@@ -97,8 +97,21 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    which run created it. `read_source_txt` re-derives the job's metadata (note, delete_video, title)
    from the `source.txt` written in phase 2, since the in-memory `jobs` list doesn't span runs.
    Transcript segments are also scanned for "screenshot"/"screengrab"/etc keyword hits
-   (`find_flagged_moments`) to produce `flagged_moments.txt`, timestamped for manual review since
-   Whisper only captures speech, not on-screen content.
+   (`find_flagged_moments`, returning moment dicts: `video_path`/`start`/`word`/`text`) to produce
+   `flagged_moments.txt`, since Whisper only captures speech, not on-screen content. If the video is
+   also flagged for deletion (`delete_video`), this is no longer just a manual-review pointer: before
+   the video is unlinked, `capture_flagged_screenshots` grabs one actual frame per moment via ffmpeg
+   (input-side `-ss`, a fast keyframe seek - not frame-exact, but hours-long video makes output-side
+   seeking too slow), downscaled to `SCREENSHOT_WIDTH` (960px), saved as `flagged_NN_HH-MM-SS.jpg`
+   next to `flagged_moments.txt`. Each screenshot is then run through the same PaddleOCR engine used
+   for photo posts (`ocr_flagged_screenshots`, lazily loaded on first use same as the carousel path),
+   and the extracted text is appended under that moment's line. A failed grab (e.g. a timestamp at
+   the very end of the file) just leaves that one moment as a text-only entry rather than failing the
+   run - `capture_flagged_screenshots`/`ocr_flagged_screenshots` mutate each moment dict in place
+   (`screenshot`, `ocr_text` keys) rather than returning parallel lists, since gaps from per-moment
+   failures would otherwise be easy to misalign. Kept videos (delete_video=False) skip this entirely
+   - there's a real video file to go re-watch, nothing to compensate for. The same applies to videos
+   mixed into a carousel in phase 2 (per-video, since a carousel can hold more than one).
 
 4. Folder naming (`build_final_name`) always prefers a slug of the actual transcript/caption/OCR
    text over the platform title, because platform titles are frequently boilerplate or missing
@@ -110,7 +123,13 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    history: counts, failures classified via `classify_error` as either
    "looks private/login-walled" or "other error", and every personal note - the durable record even
    after individual clip folders might later be pruned by hand). A Telegram summary message is also
-   sent back to the user at the end of each run.
+   sent back to the user at the end of each run. Just before building that summary, it also peeks at
+   `tg_get_updates` again at the same offset (`cfg["last_update_id"] + 1`) purely to count anything
+   that arrived after this run's own fetch (a multi-hour transcription leaves a wide window) -
+   read-only, since `last_update_id` is never advanced past what this run actually processed, so
+   nothing it sees here is skipped later; it's reported in both `log.txt` and the Telegram summary
+   ("N new message(s) came in while this was running, will be picked up next run") so a link sent
+   mid-run doesn't look lost.
 
 `config.json` (gitignored, real secrets/state) vs `config.example.json` (committed template) is the
 only config split; there's no environment-variable or CLI-flag configuration.
