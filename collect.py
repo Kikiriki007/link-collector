@@ -84,8 +84,11 @@ def tg_get_updates(token: str, offset: int) -> list:
 
 def tg_send_message(token: str, chat_id, text: str) -> None:
     try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                       data={"chat_id": chat_id, "text": text}, timeout=30)
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                           data={"chat_id": chat_id, "text": text}, timeout=30)
+        r.raise_for_status()  # Telegram rejects a >4096-char message (e.g. a very verbose failure
+        # reason) with a 400, not a connection-level error - without this, that response was
+        # silently ignored: the run finished and logged normally, but no summary ever arrived.
     except requests.RequestException as e:
         print(f"  (warning: failed to send Telegram summary: {e})", flush=True)
 
@@ -468,7 +471,18 @@ def transcribe_video(model, device: str, video_path: Path, out_dir: Path,
                      delete_video: bool) -> dict:
     """Transcribes video_path and writes the transcript files into out_dir, named after the
     video's own stem (video.txt, video_02.srt, ...). Returns Whisper's result dict."""
-    result = model.transcribe(str(video_path), fp16=(device == "cuda"), verbose=False)
+    try:
+        result = model.transcribe(str(video_path), fp16=(device == "cuda"), verbose=False)
+    except RuntimeError as e:
+        # A silent video (no audio stream at all - some Reels/carousel clips genuinely have none)
+        # makes Whisper's ffmpeg call fail with its *entire* compiled-in banner (version, build
+        # flags, library versions) crammed into the exception text - thousands of characters for
+        # what's really just "there's no audio here". Caught once, by hand, on a real clip: this
+        # was long enough (stacked with a couple other failures the same run) to push the Telegram
+        # summary over Telegram's 4096-char limit, which failed the whole send silently.
+        if "does not contain any stream" in str(e):
+            raise RuntimeError("no audio track (silent video)") from e
+        raise
     opts = {"max_line_width": 80, "max_line_count": 2}
     if delete_video:
         # no video to sync captions to - keep just the plain-text transcript
@@ -565,6 +579,13 @@ def main() -> int:
                 info = download_video(job["url"], stage_dir, cfg)
             except Exception as e:
                 if looks_like_image_post(str(e)):
+                    # download_video can partially succeed before erroring - e.g. a carousel's
+                    # first entry is itself a video, downloaded fine as video.<ext>, before a later
+                    # image-only entry raises "no video formats found" for the whole extraction.
+                    # Clear whatever it left behind before retrying as a carousel, so that stray,
+                    # untracked file doesn't survive alongside download_post's own correctly-named
+                    # output (video_NN.*) - never transcribed, never deleted, just dead weight.
+                    shutil.rmtree(stage_dir, ignore_errors=True)
                     try:
                         post = download_post(job["url"], stage_dir, cfg)
                     except Exception as e2:

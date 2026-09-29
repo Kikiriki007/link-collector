@@ -112,6 +112,13 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    failures would otherwise be easy to misalign. Kept videos (delete_video=False) skip this entirely
    - there's a real video file to go re-watch, nothing to compensate for. The same applies to videos
    mixed into a carousel in phase 2 (per-video, since a carousel can hold more than one).
+   `transcribe_video` also catches the specific case of a silent video (no audio stream at all -
+   some Reels/carousel clips genuinely have none): Whisper's ffmpeg call fails on those with its
+   entire compiled-in banner crammed into the exception text, thousands of characters for what's
+   really just "no audio here" - caught by `"does not contain any stream" in str(e)` and re-raised
+   as a short `"no audio track (silent video)"` instead. Root-caused by hand: a real run hit this on
+   three clips at once, and the stacked raw ffmpeg-banner failures pushed the end-of-run Telegram
+   summary over Telegram's 4096-char limit - see phase 5.
 
 4. Folder naming (`build_final_name`) always prefers a slug of the actual transcript/caption/OCR
    text over the platform title, because platform titles are frequently boilerplate or missing
@@ -129,7 +136,11 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    read-only, since `last_update_id` is never advanced past what this run actually processed, so
    nothing it sees here is skipped later; it's reported in both `log.txt` and the Telegram summary
    ("N new message(s) came in while this was running, will be picked up next run") so a link sent
-   mid-run doesn't look lost.
+   mid-run doesn't look lost. `tg_send_message` also checks `r.raise_for_status()` now rather than
+   only catching connection-level errors - Telegram rejects an over-limit message (>4096 chars) with
+   a plain 400 response, not a network exception, so without this a run could finish and log
+   normally while the summary silently never arrived. Caught by hand: the silent-video failure above
+   was verbose enough, stacked with a couple other failures in the same run, to trigger exactly that.
 
 `config.json` (gitignored, real secrets/state) vs `config.example.json` (committed template) is the
 only config split; there's no environment-variable or CLI-flag configuration.
