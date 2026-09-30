@@ -564,6 +564,7 @@ def main() -> int:
     transcribe_failures = []  # list of (identifier, reason)
     personal_notes = []
     flagged_counts = []
+    silent_videos = []  # finalized with no transcript - a confirmed fact, not worth retrying forever
     staging_dirs = []
     ocr_engine = None  # lazy: loaded on first image post this run, reused after that
     whisper_bundle = None  # lazy (model, device): loaded on first video this run, reused after
@@ -738,8 +739,30 @@ def main() -> int:
                     meta = read_source_txt(stage_dir)
                     video_path = find_video_file(stage_dir)
                     print(f"[{i}/{len(staging_dirs)}] transcribing: {video_path.name}", flush=True)
-                    result = transcribe_video(model, device, video_path, stage_dir,
-                                              meta["delete_video"])
+                    try:
+                        result = transcribe_video(model, device, video_path, stage_dir,
+                                                  meta["delete_video"])
+                    except RuntimeError as e:
+                        if "no audio track" not in str(e):
+                            raise
+                        # A confirmed structural fact about the file, not a transient failure -
+                        # retrying it every run forever would just pile up in _staging_* forever.
+                        # Finalize it now instead: kept regardless of delete_video (nothing else
+                        # captures its content), named from the caption if there is one since
+                        # there's no transcript to name it from.
+                        print(f"  no audio track - keeping video, skipping transcript", flush=True)
+                        caption_path = stage_dir / "caption.txt"
+                        caption = caption_path.read_text(encoding="utf-8") if caption_path.exists() else ""
+                        final_name = build_final_name(meta["title"], caption, fallback_id=stage_dir.name)
+                        final_dir = unique_dest(stage_dir.parent, final_name)
+                        (stage_dir / "video.txt").write_text(
+                            "[no audio track - this video has no speech to transcribe]\n",
+                            encoding="utf-8")
+                        stage_dir.rename(final_dir)
+                        silent_videos.append(final_dir.name)
+                        if meta["note"]:
+                            personal_notes.append(f'{final_dir.name}: "{meta["note"]}"')
+                        continue
 
                     final_name = build_final_name(meta["title"], result["text"],
                                                    fallback_id=stage_dir.name)
@@ -820,6 +843,10 @@ def main() -> int:
         log_lines.append("flagged moments (see flagged_moments.txt in each folder):")
         for line in flagged_counts:
             log_lines.append(f"  - {line}")
+    if silent_videos:
+        log_lines.append("silent (no audio track, kept without a transcript):")
+        for name in silent_videos:
+            log_lines.append(f"  - {name}")
     if skipped:
         log_lines.append(f"skipped (no URL found, {len(skipped)}):")
         for preview in skipped:
@@ -840,6 +867,8 @@ def main() -> int:
                     f"Transcribed {transcribe_ok} ({len(transcribe_failures)} failed).")
         if flagged_counts:
             summary += f"\n{len(flagged_counts)} video(s) had flagged moments - see flagged_moments.txt."
+        if silent_videos:
+            summary += f"\n{len(silent_videos)} video(s) had no audio track - kept, no transcript."
         if all_failures:
             summary += "\n" + "\n".join(f"- {url} ({reason})" for url, reason in all_failures)
         summary_parts.append(summary)

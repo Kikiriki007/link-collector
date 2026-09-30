@@ -119,6 +119,18 @@ state (`last_update_id`), which is what makes manual runs and the scheduled task
    as a short `"no audio track (silent video)"` instead. Root-caused by hand: a real run hit this on
    three clips at once, and the stacked raw ffmpeg-banner failures pushed the end-of-run Telegram
    summary over Telegram's 4096-char limit - see phase 5.
+   In the single-video staging loop specifically, that same error is caught a second time, one
+   level up, and treated as final rather than retry-worthy: a silent video is a fixed fact about
+   the file, not a transient failure, so leaving it in `_staging_*` would just re-fail and re-log
+   the same way every run forever. It's finalized immediately instead - kept regardless of
+   `delete_video` (nothing else captures its content), named from `caption.txt` if there is one
+   since there's no transcript to name it from, with a placeholder `video.txt` explaining why
+   there's no real transcript. Reported separately from both `transcribe_ok` and
+   `transcribe_failures` (a distinct "silent (no audio track, kept without a transcript):" section
+   in `log.txt` and the Telegram summary), since it's neither a success nor an ongoing problem.
+   Carousel videos don't need this: a carousel is always finalized in phase 2 regardless of any
+   one video's transcribe outcome (a failed one is simply excluded from `deletable_videos`, so it's
+   kept automatically), and carousels never re-enter `_staging_*` resume flow anyway.
 
 4. Folder naming (`build_final_name`) always prefers a slug of the actual transcript/caption/OCR
    text over the platform title, because platform titles are frequently boilerplate or missing
