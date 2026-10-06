@@ -38,7 +38,20 @@ against a real link sent to the bot (or a leftover `_staging_*` folder for the r
 ## Architecture
 
 `collect.py` runs as a single pass, structured in phases that all share the *same* `config.json`
-state (`last_update_id`), which is what makes manual runs and the scheduled task safe to interleave:
+state (`last_update_id`), which is what makes manual runs and the scheduled task safe to interleave
+- but only because they don't actually overlap in time. Before anything else, `main()` calls
+`acquire_lock()`, which grabs an OS-level exclusive lock on `collect.lock` (`msvcrt.locking` on
+Windows, `fcntl.flock` elsewhere) and exits immediately (code 1, no work done) if another instance
+already holds it. This matters because a manual run and the scheduled task *can* genuinely overlap
+- e.g. the task's `StartWhenAvailable` catching up on a missed trigger right as someone runs it by
+hand - and without this, two instances would race to download into the same deterministic
+`_staging_<update_id>` folder (derived from the message's own `update_id`, not randomized per
+process), double up on Whisper/PaddleOCR load, and last-write-wins on `config.json`. The lock is
+held by keeping the file object open as a local variable for `main()`'s entire body - no explicit
+release needed, and crucially no stale-lock cleanup logic either: the OS drops the lock the moment
+the process exits for *any* reason, including a hard kill, which a plain PID-in-a-file scheme
+can't offer (verified by hard-killing a lock holder mid-run and confirming a new instance could
+acquire it immediately after, with no leftover state to detect or clear).
 
 1. **Fetch Telegram updates** (`tg_get_updates`) since `last_update_id`. An `edited_message`/
    `edited_channel_post` update (Telegram sends these for actual edits, but also automatically once

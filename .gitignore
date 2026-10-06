@@ -6,6 +6,7 @@ config.json
 log.txt
 *.log
 cookies.txt
+collect.lock
 
 
 # in case output_root ever gets pointed inside the repo by mistake

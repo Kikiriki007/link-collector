@@ -21,6 +21,7 @@ See README.md for full setup.
 """
 import datetime as dt
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -37,6 +38,7 @@ from whisper.utils import get_writer
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 LOG_PATH = BASE_DIR / "log.txt"
+LOCK_PATH = BASE_DIR / "collect.lock"
 
 URL_RE = re.compile(r"https?://\S+")
 SAVE_RE = re.compile(r"\bsave\b", re.I)
@@ -49,6 +51,43 @@ VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".flv", ".ts"}
 # "go look at the video here" moments without doing actual frame analysis (yet).
 DEFAULT_FLAG_KEYWORDS = ["screenshot", "screenshots", "screengrab", "screengrabs",
                           "screen grab", "screen grabs", "screen shot", "screen shots"]
+
+
+# --- locking -------------------------------------------------------------------
+def acquire_lock():
+    """Grabs an OS-level exclusive lock on LOCK_PATH, held for as long as the returned file object
+    stays open - which, as a local variable in main(), is exactly this process's lifetime. The OS
+    releases the lock automatically on exit (even a crash or kill), so there's no stale-lock state
+    to detect or clean up by hand, unlike a plain PID-in-a-file scheme. Returns None if another
+    instance already holds it - a manual run and the scheduled task can otherwise genuinely overlap
+    (e.g. the task catching up on a missed trigger right as someone runs it by hand), each racing
+    to download into the same deterministic _staging_<update_id> folder at once."""
+    f = None
+    try:
+        f = open(LOCK_PATH, "w+")
+        f.write(f"{os.getpid()}\n")
+        f.flush()
+        f.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except OSError:
+        # Windows can already deny the plain write/flush above with a sharing violation while
+        # another process holds the file open - not just the explicit lock call below - so this
+        # has to wrap the whole sequence, not just msvcrt.locking/fcntl.flock. The close() below
+        # can raise the same sharing violation again (it flushes whatever didn't make it out
+        # above), which isn't a new problem worth surfacing - we already know we don't have the
+        # lock, that's all this function promises to report.
+        if f is not None:
+            try:
+                f.close()
+            except OSError:
+                pass
+        return None
 
 
 # --- config -------------------------------------------------------------------
@@ -496,6 +535,13 @@ def transcribe_video(model, device: str, video_path: Path, out_dir: Path,
 
 # --- main -------------------------------------------------------------------
 def main() -> int:
+    lock = acquire_lock()
+    if lock is None:
+        print("Another collect.py run is already in progress (collect.lock is held) - exiting "
+              "rather than risk a duplicate download or a racing transcription. Just try again "
+              "once that run finishes.", file=sys.stderr)
+        return 1
+
     cfg = load_config()
     token = cfg["bot_token"]
     output_root = Path(cfg["output_root"])

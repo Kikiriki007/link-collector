@@ -114,6 +114,13 @@ started. The end-of-run summary tells you when this happened - "N new message(s)
 this was running, will be picked up next run" - so you're not left wondering whether a link you
 sent mid-run actually got seen.
 
+### Running it twice at once
+
+If you run `collect.py` by hand right as the scheduled task also happens to fire (e.g. it's
+catching up on a missed trigger from the PC having been asleep), the second one to start just
+prints a message and exits immediately instead of racing the first - nothing gets double-downloaded
+or double-transcribed. Just re-run it once the first one finishes.
+
 ## Flagged moments — catching what's on screen, not just what's said
 
 Whisper only transcribes speech, so anything shown on screen but not narrated (a slide, a URL, a
