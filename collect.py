@@ -4,7 +4,11 @@ collect.py - Telegram link -> download -> transcribe collector.
 Send a video link (Reel/Short/TikTok/YouTube/etc.) to your Telegram bot. Running this script
 (manually or via the daily scheduled task) pulls new messages, downloads each link's video with
 yt-dlp, transcribes it with Whisper, and files the pair into a readable folder under
-`output_root\<date>\<title>__<transcript-snippet>\`.
+`output_root\<date>\<title>__<transcript-snippet>\`. A voice note or audio file (.m4a, .mp3, ...)
+sent directly, no link at all, gets transcribed the same way - downloaded straight from Telegram
+instead of yt-dlp. Set `"whisper_language"` in config.json to force a language (e.g. `"sr"`) for
+that path instead of Whisper's auto-detect, useful for consistently-non-English or code-switched
+audio; it only applies to direct audio messages, not video links.
 
 Message rule: send *only* the bare link -> the video is kept. Add any other text to the message ->
 that text becomes a PERSONAL NOTE (saved in that clip's source.txt and echoed into log.txt) *and*
@@ -19,6 +23,7 @@ Usage:
 Requires config.json next to this file (copy config.example.json and fill in your bot token).
 See README.md for full setup.
 """
+import atexit
 import datetime as dt
 import json
 import os
@@ -45,6 +50,7 @@ SAVE_RE = re.compile(r"\bsave\b", re.I)
 PRIVATE_KEYWORDS = ("login", "log in", "private", "restrict", "permission", "not available",
                     "n't available", "sign in", "certain audiences", "age-restricted")
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".flv", ".ts"}
+AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".ogg", ".oga", ".opus", ".flac", ".aac", ".wma"}
 
 # Words that, when the video's own narrator says them, are a strong hint that something on
 # screen right then matters - Whisper only catches speech, so this is the cheap way to flag
@@ -114,6 +120,20 @@ def advance_last_update_id(cfg: dict, update_id: int) -> None:
 
 
 # --- telegram -------------------------------------------------------------------
+def tg_api_base(cfg: dict) -> str:
+    """The real api.telegram.org, unless a self-hosted local Bot API server is configured (see
+    local-bot-api/README.md) - that's the only thing that lifts the public API's hard 20MB
+    download / 50MB upload caps. Only ever used by tg_download_file's getFile call, deliberately -
+    getUpdates/sendMessage always use the real API regardless of this, since a local server
+    assigns its own update_id sequence, completely disconnected from the real one for the exact
+    same messages (confirmed by hand: the same file was 958651485 there vs. 649679817 here, and it
+    even dropped 2 of 6 real pending messages outright). last_update_id has to mean the same thing
+    every run, or a stored local-server value would make the real API's offset-based getUpdates
+    stop seeing new messages forever once this is turned off again. Dormant by default: nothing
+    changes unless "local_bot_api_url" is actually set in config.json."""
+    return cfg.get("local_bot_api_url") or "https://api.telegram.org"
+
+
 def tg_get_updates(token: str, offset: int) -> list:
     r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates",
                       params={"offset": offset}, timeout=30)
@@ -130,6 +150,142 @@ def tg_send_message(token: str, chat_id, text: str) -> None:
         # silently ignored: the run finished and logged normally, but no summary ever arrived.
     except requests.RequestException as e:
         print(f"  (warning: failed to send Telegram summary: {e})", flush=True)
+
+
+LOCAL_BOT_API_CONTAINER_DIR = "/var/lib/telegram-bot-api"
+LOCAL_BOT_API_CONTAINER_NAME = "link-collector-bot-api"  # matches docker-compose.yml
+DOCKER_DESKTOP_EXE = r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
+
+
+def _docker_daemon_ready() -> bool:
+    try:
+        r = subprocess.run(["docker", "info"], capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def ensure_docker_desktop_running(cfg: dict, attempts: int = 60, delay: float = 2.0) -> None:
+    """Launches Docker Desktop if its daemon isn't already reachable, and waits for it to come up.
+    This machine doesn't have Docker Desktop's own "start at login" setting enabled, and even one
+    that does can still lose the race: a fully unattended run (PC off overnight, turned on once
+    the next morning and left alone) can have the scheduled task's missed-trigger catch-up fire
+    while Docker Desktop is still mid-launch (30-60+ seconds cold). Without this, that scenario
+    fails at the very first step every time - confirmed by hand that the daemon genuinely isn't
+    reachable immediately after login with autostart off."""
+    if _docker_daemon_ready():
+        return
+    exe = cfg.get("docker_desktop_exe") or DOCKER_DESKTOP_EXE
+    if not Path(exe).exists():
+        raise RuntimeError(f'Docker daemon isn\'t running and Docker Desktop wasn\'t found at '
+                           f'"{exe}" to launch it - set "docker_desktop_exe" in config.json if '
+                           f"it's installed somewhere else.")
+    subprocess.Popen([exe])
+    for attempt in range(attempts):
+        if _docker_daemon_ready():
+            return
+        time.sleep(delay)
+    raise RuntimeError(f"launched Docker Desktop but its daemon never became reachable after "
+                       f"{attempts * delay:.0f}s")
+
+
+def start_local_bot_api(container: str, base_url: str, cfg: dict,
+                        attempts: int = 10, delay: float = 1.0) -> None:
+    """Starts the local Bot API container for this run - idempotent (docker start on an
+    already-running container is a harmless no-op), so it's safe to call unconditionally rather
+    than checking state first. Raises with Docker's own error text (not just a generic non-zero
+    exit) if the start itself fails. `docker start` returns as soon as the container process
+    launches, well before the server inside is actually ready to accept connections - confirmed by
+    hand, the very first real request right after a start failed every time with "Remote end
+    closed connection" - so this polls the port afterward instead of assuming it's ready; any HTTP
+    response at all (even a 404) means it's actually listening. Every Telegram call this run makes
+    depends on this container being reachable, so every failure mode here raises rather than
+    limping into a run full of connection errors."""
+    ensure_docker_desktop_running(cfg)
+    try:
+        subprocess.run(["docker", "start", container], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(e.stderr.strip() or str(e)) from e
+    except FileNotFoundError as e:
+        raise RuntimeError("docker command not found - is Docker Desktop installed?") from e
+
+    for attempt in range(attempts):
+        try:
+            requests.get(base_url, timeout=3)
+            return
+        except requests.RequestException:
+            if attempt == attempts - 1:
+                raise RuntimeError(f"container started but never became reachable at {base_url}")
+            time.sleep(delay)
+
+
+def stop_local_bot_api(container: str) -> None:
+    """Stops the local Bot API container - registered via atexit so it runs whether this run
+    finishes normally, fails, or hits Ctrl+C (not a hard kill/crash - same caveat as the lock
+    file). Best-effort: a failure here shouldn't mask whatever this run actually did, just warn."""
+    try:
+        subprocess.run(["docker", "stop", container], check=True, capture_output=True, text=True)
+    except Exception as e:
+        print(f"  (warning: failed to stop local bot API container: {e})", flush=True)
+
+
+def stop_docker_desktop() -> None:
+    """Quits Docker Desktop entirely, not just the bot-api container - registered via atexit
+    *before* stop_local_bot_api so it fires after it (atexit runs LIFO): the container gets a
+    clean `docker stop` first, then the whole app goes down, rather than yanking the backend out
+    from under a running container. Keeps this fully off-footprint between batches rather than
+    leaving Docker Desktop (and the WSL2 VM backing it) idling in the background all day for the
+    sake of one scheduled run. Best-effort, same reasoning as stop_local_bot_api."""
+    try:
+        subprocess.run(["taskkill", "/IM", "Docker Desktop.exe", "/F"],
+                       capture_output=True, text=True)
+    except Exception as e:
+        print(f"  (warning: failed to stop Docker Desktop: {e})", flush=True)
+
+
+def tg_download_file(token: str, file_id: str, dest_path: Path, cfg: dict) -> None:
+    """Downloads a Telegram-hosted file (voice note/audio/document attachment) - no yt-dlp
+    involved, this isn't a social-media link. Against the real api.telegram.org, getFile's
+    file_path is a relative path downloaded over HTTP, same as always - the public API hard-caps
+    this at 20MB (this is the whole reason local-bot-api/ exists). Against a self-hosted local Bot
+    API server (TELEGRAM_LOCAL=1 - see local-bot-api/README.md), file_path is instead an *absolute
+    path inside that server's own container*, under LOCAL_BOT_API_CONTAINER_DIR - and the old HTTP
+    route is simply gone in this mode (confirmed by hand: a real getFile there now 404s). Pulling
+    the file out with `docker cp` instead works regardless of how the container's volume is set
+    up (named volume or bind mount) - verified against a real local server: a host bind-mount
+    straight to /var/lib/telegram-bot-api crashes the server outright (SIGABRT), since
+    telegram-bot-api names each bot's data directory after the literal token, which contains a
+    colon - an invalid path character on Windows. `docker cp` sidesteps that entirely by going
+    through the Docker daemon instead of the host filesystem."""
+    base_url = tg_api_base(cfg)
+    # In local mode, the server fetches the file's actual bytes over MTProto before this call can
+    # return at all - confirmed by hand that a 58MB file took well over 15s (succeeded at 60s) on
+    # its first request, so this needs real headroom, not the quick metadata-lookup timeout that's
+    # enough against the real API.
+    r = requests.get(f"{base_url}/bot{token}/getFile",
+                      params={"file_id": file_id}, timeout=180)
+    if not r.ok:
+        # requests' own raise_for_status() only gives "400 Client Error: Bad Request for url:
+        # ..." - Telegram's real reason (e.g. "file is too big", the Bot API's hard 20 MB
+        # download cap, hit on a real ~20-minute voice note) is in the JSON body, thrown away by
+        # default. Surfacing it here is the difference between a useless error and an actionable
+        # one, both in log.txt and the Telegram summary.
+        try:
+            desc = r.json().get("description", r.text)
+        except ValueError:
+            desc = r.text
+        raise RuntimeError(f"Telegram getFile failed: {desc}")
+    file_path = r.json()["result"]["file_path"]
+
+    if cfg.get("local_bot_api_url") and file_path.startswith(LOCAL_BOT_API_CONTAINER_DIR):
+        container = cfg.get("local_bot_api_container_name") or LOCAL_BOT_API_CONTAINER_NAME
+        subprocess.run(["docker", "cp", f"{container}:{file_path}", str(dest_path)],
+                       check=True, capture_output=True, text=True)
+        return
+
+    r2 = requests.get(f"{base_url}/file/bot{token}/{file_path}", timeout=120)
+    r2.raise_for_status()
+    dest_path.write_bytes(r2.content)
 
 
 def _finalize_note(remainder: str):
@@ -180,6 +336,25 @@ def find_message_url(msg: dict):
     return None, None, False
 
 
+def find_message_audio(msg: dict):
+    """Returns {'file_id', 'file_name'} for a voice note, audio file, or a document that's
+    actually audio (by mime type or extension) - None otherwise. Only checked when no URL was
+    found (find_message_url takes priority), since pasting a link alongside an audio attachment
+    is rare and the link is the more actionable thing to act on."""
+    for key in ("voice", "audio"):
+        att = msg.get(key)
+        if att:
+            return {"file_id": att["file_id"],
+                    "file_name": att.get("file_name") or f"{att['file_id']}.ogg"}
+    doc = msg.get("document")
+    if doc:
+        name = doc.get("file_name") or ""
+        mime = doc.get("mime_type") or ""
+        if mime.startswith("audio/") or Path(name).suffix.lower() in AUDIO_EXTS:
+            return {"file_id": doc["file_id"], "file_name": name or f"{doc['file_id']}.m4a"}
+    return None
+
+
 # --- download -------------------------------------------------------------------
 def classify_error(err_text: str) -> str:
     low = err_text.lower()
@@ -201,7 +376,12 @@ LONG_FORM_MIN_SECONDS = 180  # yt-dlp's "duration" field, in seconds
 # happens at the actual data-fetch stage, after a format was already successfully selected, so
 # it's a signed-CDN-URL/session mismatch rather than a real permission error (which surfaces
 # earlier, during extraction) - re-extracting gets a fresh URL and has succeeded every time so far.
-TRANSIENT_ERROR_SUBSTRINGS = ("needs to be reloaded", "http error 403")
+# "video unavailable" is a third symptom of the exact same stale-cookie-DB root cause: isolated by
+# hand on a real video that failed with cookies and succeeded immediately without them, same URL,
+# same moment, cookies the only variable - not an actually-deleted/region-blocked video, which
+# would fail the same way with or without cookies. If a video genuinely is gone, dropping cookies
+# on retry just gets the same (or an equally definitive) failure, so this never masks a real one.
+TRANSIENT_ERROR_SUBSTRINGS = ("needs to be reloaded", "http error 403", "video unavailable")
 
 
 RETRY_BACKOFF_SECONDS = (0, 5, 15, 30)
@@ -507,11 +687,16 @@ def load_whisper(cfg: dict):
 
 
 def transcribe_video(model, device: str, video_path: Path, out_dir: Path,
-                     delete_video: bool) -> dict:
-    """Transcribes video_path and writes the transcript files into out_dir, named after the
-    video's own stem (video.txt, video_02.srt, ...). Returns Whisper's result dict."""
+                     delete_video: bool, language: str = None) -> dict:
+    """Transcribes video_path (or any audio file - Whisper doesn't care) and writes the
+    transcript files into out_dir, named after the source's own stem (video.txt, video_02.srt,
+    ...). language forces Whisper's language instead of auto-detecting from the first ~30s, which
+    matters for code-switched audio (e.g. mostly-Serbian voice notes with the odd English word) -
+    None keeps the existing auto-detect behavior for every other caller. Returns Whisper's
+    result dict."""
     try:
-        result = model.transcribe(str(video_path), fp16=(device == "cuda"), verbose=False)
+        result = model.transcribe(str(video_path), fp16=(device == "cuda"), verbose=False,
+                                  language=language)
     except RuntimeError as e:
         # A silent video (no audio stream at all - some Reels/carousel clips genuinely have none)
         # makes Whisper's ffmpeg call fail with its *entire* compiled-in banner (version, build
@@ -546,6 +731,29 @@ def main() -> int:
     token = cfg["bot_token"]
     output_root = Path(cfg["output_root"])
     output_root.mkdir(parents=True, exist_ok=True)
+
+    if cfg.get("local_bot_api_url"):
+        # getUpdates/sendMessage deliberately stay on the real api.telegram.org even when this is
+        # configured - only tg_download_file's getFile call actually uses it. Root-caused by hand:
+        # a self-hosted local server assigns its own update_id sequence, completely disconnected
+        # from the real API's numbering for the exact same messages (e.g. 958651485 there vs.
+        # 649679817 here, for the identical file) - it even dropped 2 of 6 real pending messages
+        # entirely. last_update_id has to mean the same thing every run regardless of whether this
+        # is configured, or a stored local-server value would make the real API's offset-based
+        # getUpdates stop seeing new messages forever (its own numbering will never catch up to
+        # one that high). file_id, unlike update_id, is confirmed portable between the two servers.
+        container = cfg.get("local_bot_api_container_name") or LOCAL_BOT_API_CONTAINER_NAME
+        try:
+            start_local_bot_api(container, cfg["local_bot_api_url"], cfg)
+        except Exception as e:
+            print(f"Couldn't start the local Bot API container ({container}): {e}\n"
+                  f"Is Docker Desktop running? See local-bot-api/README.md.", file=sys.stderr)
+            return 1
+        # Registered in this order (not the reverse) because atexit runs LIFO: stop_local_bot_api
+        # - a clean `docker stop` - needs to fire *before* stop_docker_desktop yanks the whole
+        # backend out from under it.
+        atexit.register(stop_docker_desktop)
+        atexit.register(stop_local_bot_api, container)
 
     updates = tg_get_updates(token, cfg.get("last_update_id", 0) + 1)
 
@@ -590,13 +798,20 @@ def main() -> int:
             advance_last_update_id(cfg, update_id)
             continue
         url, note, delete_video = find_message_url(msg)
-        if not url:
-            has_media = bool(msg.get("photo") or msg.get("video") or msg.get("document"))
-            preview = text.strip()[:60] or ("[media, no text/caption]" if has_media else "[empty message]")
-            skipped.append(preview)
-            advance_last_update_id(cfg, update_id)
+        if url:
+            jobs.append({"update_id": update_id, "kind": "url", "url": url, "note": note,
+                         "delete_video": delete_video})
             continue
-        jobs.append({"update_id": update_id, "url": url, "note": note, "delete_video": delete_video})
+        audio = find_message_audio(msg)
+        if audio:
+            note, delete_video = _finalize_note(text.strip())
+            jobs.append({"update_id": update_id, "kind": "audio", "note": note,
+                         "delete_video": delete_video, **audio})
+            continue
+        has_media = bool(msg.get("photo") or msg.get("video") or msg.get("document"))
+        preview = text.strip()[:60] or ("[media, no text/caption]" if has_media else "[empty message]")
+        skipped.append(preview)
+        advance_last_update_id(cfg, update_id)
 
     cancel_seen = cancelled_count > 0
     if cancel_seen:
@@ -619,8 +834,63 @@ def main() -> int:
 
     try:
         for i, job in enumerate(jobs, 1):
-            print(f"[{i}/{len(jobs)}] downloading: {job['url']}", flush=True)
             stage_dir = today_dir / f"_staging_{job['update_id']}"
+
+            if job["kind"] == "audio":
+                # A direct voice note/audio attachment, not a social-media link - no yt-dlp, no
+                # OCR, no carousel, and no _staging_* resume (same reasoning as carousels: these
+                # are short, so an interrupted one is simply redone from scratch next run rather
+                # than needing the deferred-transcription machinery built for hours-long video).
+                print(f"[{i}/{len(jobs)}] downloading audio: {job['file_name']}", flush=True)
+                try:
+                    stage_dir.mkdir(parents=True, exist_ok=True)
+                    ext = Path(job["file_name"]).suffix.lower() or ".m4a"
+                    audio_path = stage_dir / f"audio{ext}"
+                    tg_download_file(token, job["file_id"], audio_path, cfg)
+
+                    if whisper_bundle is None:
+                        whisper_bundle = load_whisper(cfg)
+                    model, device = whisper_bundle
+                    result = transcribe_video(model, device, audio_path, stage_dir,
+                                              job["delete_video"],
+                                              language=cfg.get("whisper_language"))
+
+                    final_name = build_final_name("", result["text"], fallback_id=stage_dir.name)
+                    final_dir = unique_dest(stage_dir.parent, final_name)
+
+                    lines = [
+                        f"SOURCE: telegram audio ({job['file_name']})",
+                        f"RECEIVED: {dt.datetime.now().isoformat(timespec='seconds')}",
+                        f"AUDIO: {'deleted-after-transcribe' if job['delete_video'] else 'keep'}",
+                    ]
+                    if job["note"]:
+                        lines.append(f"PERSONAL NOTE: {job['note']}")
+                    (stage_dir / "source.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+                    stage_dir.rename(final_dir)
+                    if job["delete_video"]:
+                        (final_dir / audio_path.name).unlink(missing_ok=True)
+
+                    moments = find_flagged_moments(final_dir / audio_path.name,
+                                                   result.get("segments", []), flag_keyword_re)
+                    if moments:
+                        write_flagged_moments(final_dir, moments, flag_keywords)
+                        print(f"  -> {len(moments)} flagged moment(s) "
+                              f"(screenshot/screengrab mentions)", flush=True)
+                        flagged_counts.append(f"{final_dir.name}: {len(moments)} moment(s)")
+
+                    if job["note"]:
+                        personal_notes.append(f'{final_dir.name}: "{job["note"]}"')
+                    download_ok += 1
+                    transcribe_ok += 1
+                except Exception as e:
+                    print(f"  FAILED (audio): {e}", flush=True)
+                    download_failures.append((job["file_name"], classify_error(str(e))))
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+                advance_last_update_id(cfg, job["update_id"])
+                continue
+
+            print(f"[{i}/{len(jobs)}] downloading: {job['url']}", flush=True)
             post = None
             try:
                 info = download_video(job["url"], stage_dir, cfg)

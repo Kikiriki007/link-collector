@@ -1,0 +1,26 @@
+# Self-hosted Telegram Bot API server - entirely optional. collect.py works exactly as before
+# without this; it only gets used once config.json's "local_bot_api_url" is actually set (see
+# README.md in this folder). The whole point is TELEGRAM_LOCAL=1, which lifts the public Bot
+# API's hard caps (20MB download / 50MB upload) to unlimited download / 2000MB upload.
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: link-collector-bot-api
+    restart: unless-stopped
+    ports:
+      # localhost-only - this proxies your real bot token, never expose it to the network
+      - "127.0.0.1:8081:8081"
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      # Named volume, not a host bind-mount: telegram-bot-api names its per-bot data directory
+      # after the literal bot token, which contains a colon - that's an invalid path character on
+      # Windows, so a bind-mount straight to a Windows folder crashes the server (SIGABRT) the
+      # moment it tries to create that directory. A named volume lives inside Docker's own Linux
+      # VM instead, where a colon in a directory name is completely normal.
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+
+volumes:
+  telegram-bot-api-data:

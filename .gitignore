@@ -17,3 +17,7 @@ graphify-out/
 
 # local Claude Code state, machine-specific
 .claude/
+
+# local-bot-api: real credentials (its actual data lives in a Docker-managed named volume,
+# not a folder here - see docker-compose.yml)
+local-bot-api/.env

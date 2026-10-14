@@ -12,6 +12,19 @@ content of most infographic/tip-list posts, which the caption alone usually miss
 post's own caption. Any videos mixed into a carousel are downloaded and transcribed with Whisper
 like a normal clip.
 
+Voice notes and audio files (.m4a, .mp3, .ogg, ...) work too — send one with no link at all and it
+gets downloaded straight from Telegram and transcribed, same keep/delete-note rules as a video. If
+it's reliably a specific non-English language (or mixes in a few English words), set
+`"whisper_language"` (e.g. `"sr"` for Serbian) in `config.json` so Whisper doesn't have to guess
+from scratch each time — this only affects audio sent directly, not video links.
+
+**Telegram bots can't download files over 20 MB** (a hard limit of the regular Bot API, not
+something this tool can retry past) — a longer voice note can exceed that. When it happens, it's a
+clean, logged failure ("Bad Request: file is too big"), not a crash. If this becomes a regular
+problem, see [local-bot-api/README.md](local-bot-api/README.md) — an optional, self-hosted Bot
+API server that removes the cap entirely (unlimited download, 2000MB upload). Off by default;
+nothing about normal use changes unless you deliberately set it up.
+
 No AI/LLM step in the pipeline itself — it's a deterministic download-and-transcribe job. You don't
 need Claude or any API key besides your own Telegram bot token.
 
@@ -252,6 +265,7 @@ ever worth wiring up - Instagram/TikTok would need yt-dlp to fix those extractor
 | `run_collect.bat` | Thin wrapper so both Task Scheduler and a manual double-click run the same way. |
 | `setup_task.ps1` | One-time script to register the daily scheduled task. |
 | `log.txt` | Append-only run history — counts, failures, and every personal note. Not committed. |
+| `local-bot-api/` | Optional self-hosted Bot API server setup (see its own README) — only needed if a file ever exceeds Telegram's 20MB bot-download cap. |
 
 ## License
 

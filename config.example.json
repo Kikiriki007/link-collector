@@ -6,6 +6,10 @@
   "last_update_id": 0,
   "cookies_from_browser": null,
   "cookies_file": null,
+  "whisper_language": null,
   "flag_keywords": ["screenshot", "screenshots", "screengrab", "screengrabs",
-                    "screen grab", "screen grabs", "screen shot", "screen shots"]
+                    "screen grab", "screen grabs", "screen shot", "screen shots"],
+  "local_bot_api_url": null,
+  "local_bot_api_container_name": null,
+  "docker_desktop_exe": null
 }
