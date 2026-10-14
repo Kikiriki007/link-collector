@@ -47,21 +47,41 @@ unreachable, a real run launched it, waited, did real Telegram work, and tore ev
 again afterward - nothing Docker-related left running. `docker compose up -d` is only ever needed
 once, manually, the very first time, to create the container at all.
 
-That's it - every Telegram call `collect.py` makes (`getUpdates`, `sendMessage`, `getFile`) now
-goes through your local server instead of `api.telegram.org`. For large files specifically,
-`tg_download_file` pulls them straight out of the container with `docker cp` instead of
-downloading over HTTP - that's what `TELEGRAM_LOCAL=1` changes: `getFile` returns an absolute path
-*inside the container's own filesystem* instead of a URL, and the old HTTP download route simply
-stops working in this mode. `docker cp` sidesteps that regardless of how the container's storage
-is set up, which is also why the volume below is a named volume rather than a bind-mount straight
-to this folder: `telegram-bot-api` names each bot's data directory after the literal bot token,
-which contains a colon - not a valid character in a Windows path, so a host bind-mount here
-actually crashes the server outright the moment it tries to create that directory (confirmed by
-hand). A named volume lives inside Docker's own Linux VM instead, where that's a non-issue.
+That's it - but **only file downloads actually route through your local server, not everything**.
+`getUpdates`/`sendMessage` always use the real `api.telegram.org`, no matter what this is set to.
+Only `tg_download_file`'s `getFile` call uses the local server, and only to pull large files out
+with `docker cp` instead of downloading over HTTP.
+
+This split isn't an oversight - it's a fix for a real bug. The local server assigns its **own**
+`update_id` numbering for incoming messages, completely disconnected from the real API's numbers
+for the exact same messages (caught by hand: the identical file was `update_id` `958651485` on the
+local server vs. `649679817` on the real API - and the local server even silently dropped 2 of 6
+real pending messages outright). `collect.py` tracks which messages it's already processed as a
+single `last_update_id` number in `config.json`, and that number has to mean the same thing every
+run. If `getUpdates` ever routed through the local server, a run could save a local-server-style
+`update_id` into `config.json` - and the next time you point back at the real API (or just restart
+the container, which starts the local server's numbering over), that saved number would be
+meaningless there, silently and permanently: the real API would wait forever for its own counter
+to climb to a number it'll never reach, so `collect.py` would stop seeing new messages with no
+error at all. `file_id` doesn't have this problem - confirmed by hand that a `file_id` obtained
+from the real API resolves just fine through the local server's `getFile` - which is exactly why
+only that one call is safe to route through it.
+
+For large files specifically: that's what `TELEGRAM_LOCAL=1` changes about `getFile` - it returns
+an absolute path *inside the container's own filesystem* instead of a URL, and the old HTTP
+download route simply stops working in this mode (confirmed by hand: it 404s). `docker cp` sidesteps
+needing that HTTP route at all, which is also why the volume below is a named volume rather than a
+bind-mount straight to this folder: `telegram-bot-api` names each bot's data directory after the
+literal bot token, which contains a colon - not a valid character in a Windows path, so a host
+bind-mount here actually crashes the server outright the moment it tries to create that directory
+(confirmed by hand). A named volume lives inside Docker's own Linux VM instead, where that's a
+non-issue.
 
 If this repo gets moved, or the container is ever renamed in `docker-compose.yml`, update
 `"local_bot_api_container_name"` in `config.json` too (defaults to `link-collector-bot-api`,
-matching the compose file).
+matching the compose file). If Docker Desktop is installed somewhere other than the default
+`C:\Program Files\Docker\Docker\Docker Desktop.exe`, set `"docker_desktop_exe"` to the real path -
+that's what gets launched when the daemon isn't already reachable.
 
 ## Turning it off
 
@@ -80,5 +100,7 @@ docker compose ps        # Up only while collect.py is actively running
 docker compose logs -f   # live server logs
 ```
 
-A real end-to-end test (send a file through the bot, `getFile`, `docker cp` it out) has been run
-against this exact setup and confirmed working.
+Verified for real, not just in theory: a full real run processed 4 genuinely-oversized voice notes
+(up to 58MB) through this exact setup - downloaded via `getFile` + `docker cp`, transcribed, filed
+normally - while `config.json`'s `last_update_id` tracked correctly against the real API's numbers
+throughout, confirming the `getUpdates`/`getFile` split above actually holds up end to end.
