@@ -4,6 +4,7 @@
   "output_root": "C:\\Users\\YOU\\Desktop\\Video Transcripts",
   "whisper_model": "small",
   "last_update_id": 0,
+  "last_fetch_at": null,
   "cookies_from_browser": null,
   "cookies_file": null,
   "whisper_language": null,

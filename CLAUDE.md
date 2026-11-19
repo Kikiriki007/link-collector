@@ -15,6 +15,8 @@ no package structure and no tests.
 # Setup (Windows, one-time)
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m pip install --force-reinstall --no-deps torch==2.14.0 --index-url https://download.pytorch.org/whl/cu132
+.venv\Scripts\python -m pip install --no-deps paddlepaddle-gpu==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
 copy config.example.json config.json          # then fill in bot_token
 
 # Run manually
@@ -127,10 +129,16 @@ acquire it immediately after, with no leftover state to detect or clear).
    generic "400 Client Error" - needed in practice: the regular Bot API hard-caps file downloads at
    20 MB (`"Bad Request: file is too big"`), hit for real on a ~20-minute voice note, and that's the
    one piece of information actually worth showing in `log.txt`/the Telegram summary.
-   `tg_api_base(cfg)` picks `api.telegram.org` unless `"local_bot_api_url"` is set, in which case
-   `tg_download_file`'s `getFile` call - and *only* that call - goes through a self-hosted server
-   instead (`local-bot-api/` - optional, dormant unless configured, see its own README).
-   `getUpdates`/`sendMessage` deliberately always use the real API regardless of this setting -
+   `tg_download_file` always tries the real `api.telegram.org` first - cheap, no Docker, correct
+   for the overwhelming majority of files (anything under the public API's 20MB cap). Docker/the
+   self-hosted local server (`local-bot-api/` - optional, dormant unless `"local_bot_api_url"` is
+   set, see its own README) only start as a **fallback, on demand**, the moment a `getFile` call
+   actually comes back with `"file is too big"` - never upfront, never unconditionally. Most runs
+   never touch an oversized file, so most runs never touch Docker at all: no startup cost, no
+   window, nothing. Even on a run that does trigger it, only that one job's download depends on
+   Docker being available - a Docker problem fails that job, not the whole run, since the trigger
+   lives inside `tg_download_file` itself rather than gating `main()` up front.
+   `getUpdates`/`sendMessage` *never* route through the local server, under any circumstance -
    root-caused by hand after a real crash left a stray `_staging_<id>` folder with a number that
    matched nothing: a self-hosted local server assigns its *own* `update_id` sequence, completely
    disconnected from the real API's numbering for the exact same messages (the same file was
@@ -140,13 +148,33 @@ acquire it immediately after, with no leftover state to detect or clear).
    is turned off again, since its own numbering will never catch up to one that high. `file_id`,
    unlike `update_id`, is confirmed portable between the two servers (confirmed by hand: a
    `file_id` from a real `getUpdates` call resolved fine through the local server's `getFile`),
-   which is exactly why only that one call needs to route through it. That's the only thing that
-   actually lifts the 20MB/50MB caps above - a self-hosted server run with
-   `TELEGRAM_LOCAL=1` serves unlimited downloads / 2000MB uploads. In that mode `getFile`'s
-   `file_path` stops being a relative path to download over HTTP and becomes an absolute path
-   *inside that server's own container* (`LOCAL_BOT_API_CONTAINER_DIR`, `/var/lib/telegram-bot-api`)
-   - confirmed by hand that the old HTTP route simply 404s once local mode is on, so
-   `tg_download_file` detects that prefix and pulls the file out with `docker cp
+   which is exactly why only that one call is ever safe to route through it.
+   Once triggered, `start_local_bot_api(container, local_url, cfg)` runs, which first calls
+   `ensure_docker_desktop_running(cfg)`: a cheap `docker info` checks whether the daemon is even
+   reachable, and if not, launches `"docker_desktop_exe"` (default `DOCKER_DESKTOP_EXE`) and polls
+   until it is - this matters for a fully unattended run (PC off overnight, turned on once and left
+   alone) since Docker Desktop's own "start at login" setting isn't enabled here, and even a
+   machine that does enable it can still have the scheduled task's missed-trigger catch-up fire
+   while Docker Desktop is still mid-launch (confirmed by hand: a real run from a fully-quit Docker
+   Desktop recovered on its own in ~11s). Docker Desktop is Electron-based and creates its own
+   window regardless of the launching process's requested window style - `-WindowStyle Hidden` on
+   `Start-Process` still produced a fully visible, focus-stealing window, confirmed by hand - so
+   right after launch, `_minimize_docker_desktop_window()` finds that window via `EnumWindows` +
+   `GetWindowThreadProcessId` (matching by owning process name, not PID, since the visible window
+   belongs to a child process, not the one `Popen` returns) and minimizes it directly via
+   `ShowWindow(hwnd, SW_MINIMIZE)` - the same technique a published PowerShell module (GenXdev)
+   uses for this exact problem. Confirmed by hand: `IsIconic` true afterward (genuinely minimized,
+   not a no-op call) - it still flashes on screen for the few seconds the window takes to first
+   exist, just not indefinitely; purely cosmetic and never raises, so a failure here (or running on
+   non-Windows) just leaves the window alone rather than blocking anything. Then `docker start`
+   runs on the container itself (idempotent either way - `start_local_bot_api` being called again
+   later in the same run for a second oversized file just confirms it's already up), followed by a
+   `base_url` readiness poll (`docker start` returns before the server inside is actually
+   listening - confirmed by hand, "Remote end closed connection" every time without this). Once up,
+   `getFile`'s `file_path` stops being a relative path to download over HTTP and becomes an
+   absolute path *inside that server's own container* (`LOCAL_BOT_API_CONTAINER_DIR`,
+   `/var/lib/telegram-bot-api`) - confirmed by hand that the old HTTP route simply 404s once local
+   mode is on, so `tg_download_file` detects that prefix and pulls the file out with `docker cp
    <container>:<path> <dest>` instead (`"local_bot_api_container_name"`, defaulting to
    `LOCAL_BOT_API_CONTAINER_NAME` - both read with `or`, not `.get(key, default)`, since
    `config.example.json` documents the key as an explicit `null` rather than leaving it out, and
@@ -155,33 +183,24 @@ acquire it immediately after, with no leftover state to detect or clear).
    named volume rather than a host bind-mount for `/var/lib/telegram-bot-api` - confirmed by hand
    that a bind-mount there crashes the server outright (SIGABRT) the moment it tries to create a
    bot's data directory, since that directory is named after the literal bot token, which contains
-   a colon (not a valid path character on Windows). This whole path - real `api_id`/`api_hash`,
-   real container, real `sendDocument` → `getFile` → `docker cp` round trip - has been run for real
-   and confirmed working, not just mocked.
+   a colon (not a valid path character on Windows).
    Nothing Docker-related is left running between batches - not just the container, Docker Desktop
-   itself. Right after `cfg` is loaded, if `"local_bot_api_url"` is set, `main()` calls
-   `start_local_bot_api`, which first calls `ensure_docker_desktop_running(cfg)`: a cheap `docker
-   info` checks whether the daemon is even reachable, and if not, launches
-   `"docker_desktop_exe"` (default `DOCKER_DESKTOP_EXE`) and polls until it is. This matters for a
-   fully unattended run - PC off overnight, turned on once and left alone - since Docker Desktop's
-   own "start at login" setting isn't enabled here, and even a machine that does enable it can
-   still have the scheduled task's missed-trigger catch-up fire while Docker Desktop is still
-   mid-launch (confirmed by hand: a real run from a fully-quit Docker Desktop recovered on its own
-   in ~11s, versus ~4s when it was already running). Only then does `docker start` run on the
-   container itself (idempotent either way), followed by the same base_url readiness poll as
-   before (`docker start` returns before the server inside is actually listening - confirmed by
-   hand, "Remote end closed connection" every time without this). Teardown is registered in the
-   opposite order from how you'd read it, because `atexit` runs LIFO:
-   `atexit.register(stop_docker_desktop)` first, then `atexit.register(stop_local_bot_api,
-   container)` second, so `stop_local_bot_api` (a clean `docker stop`) actually *fires* first,
-   before `stop_docker_desktop` (`taskkill /IM "Docker Desktop.exe" /F`) yanks the whole backend
-   out from under it. Confirmed by hand end-to-end from a cold start: Docker Desktop fully killed
-   beforehand, daemon unreachable, real run launched it, waited for the daemon, did real Telegram
-   work through the container, then killed both the container and Docker Desktop again
-   afterward - nothing left running. Every failure mode along this path (`docker` not found,
-   Docker Desktop exe missing, daemon never comes up, container never becomes reachable) raises
-   and `return 1`s before any Telegram call is attempted, rather than cascading into a run full of
-   connection errors.
+   itself. `atexit.register(stop_docker_desktop)` and `atexit.register(stop_local_bot_api,
+   container)` are registered (in that order, not the reverse) right after `start_local_bot_api`
+   succeeds - `atexit` runs LIFO, so `stop_local_bot_api` (a clean `docker stop`) actually *fires*
+   first, before `stop_docker_desktop` (`taskkill /IM "Docker Desktop.exe" /F`) yanks the whole
+   backend out from under it. Every failure mode along this whole path (`docker` not found, Docker
+   Desktop exe missing, daemon never comes up, container never becomes reachable) raises a clear
+   `RuntimeError` that fails just the one job - `advance_last_update_id` still runs for it like any
+   other failed job, so it doesn't retry forever on its own; the link/file has to be resent once
+   whatever was wrong is fixed, same as any other "real failure" in this file.
+   Verified for real, twice: once with four real production voice notes up to 58MB, confirming
+   `last_update_id` tracks correctly against the real API throughout a whole batch; and once with a
+   synthetic 21MB file sent via `sendDocument` from a cold start (Docker Desktop fully killed
+   beforehand, daemon unreachable) specifically to prove the on-demand trigger itself - launched
+   Docker, minimized its window, started the container, downloaded the file (content verified
+   byte-for-byte against the original), and tore everything back down again after the script
+   exited - all without `main()` ever being told up front that this run would need Docker at all.
 
 3. **Transcription phase**: globs `output_root/**/​_staging_*` for **every** folder that still has a
    `video.*` in it - not just this run's fresh downloads, but also anything left mid-pipeline from a
@@ -221,9 +240,23 @@ acquire it immediately after, with no leftover state to detect or clear).
    there's no real transcript. Reported separately from both `transcribe_ok` and
    `transcribe_failures` (a distinct "silent (no audio track, kept without a transcript):" section
    in `log.txt` and the Telegram summary), since it's neither a success nor an ongoing problem.
-   Carousel videos don't need this: a carousel is always finalized in phase 2 regardless of any
-   one video's transcribe outcome (a failed one is simply excluded from `deletable_videos`, so it's
-   kept automatically), and carousels never re-enter `_staging_*` resume flow anyway.
+   Carousel videos don't need the finalize-instead-of-retry part: a carousel is always finalized
+   in phase 2 regardless of any one video's transcribe outcome (a failed one is simply excluded
+   from `deletable_videos`, so it's kept automatically), and carousels never re-enter `_staging_*`
+   resume flow anyway. They do get the same *reporting*: a silent carousel clip goes into
+   `silent_videos` as `<folder> [video_NN.mp4]` rather than `transcribe_failures`, so a post with
+   silent clips doesn't show up as "N failed" in `log.txt`/the Telegram summary.
+   `load_whisper` and `load_ocr_engine` use the GPU when available, unless `gpu_busy_reason` reports
+   it's in use (`nvidia-smi` averaging at least `GPU_BUSY_UTIL_PERCENT` over `GPU_BUSY_SAMPLES`
+   readings, or less free VRAM than `WHISPER_VRAM_MB`/`OCR_VRAM_MB` require for whichever model
+   loads first), in which case both use the CPU for the whole run. The GPU is read only once per
+   run, before the run's own work starts, because residual load from OCR otherwise looks like
+   another program using it. If `nvidia-smi` can't be read, the GPU is still used. Whisper and
+   OCR share the GPU one job at a time: measured on an RTX 4050 (6 GB), 3 parallel Whisper instances
+   gave only 1.04x the throughput of one, so parallelism isn't worth adding. `paddlepaddle-gpu` is
+   installed `--no-deps` and uses the CUDA libraries torch loads, so torch must be imported first
+   (it is, at the top of this file). If an NVIDIA GPU exists but a library's build can't use it,
+   `note_missing_gpu_build` adds a warning to `log.txt` and the Telegram summary.
 
 4. Folder naming (`build_final_name`) always prefers a slug of the actual transcript/caption/OCR
    text over the platform title, because platform titles are frequently boilerplate or missing
@@ -246,6 +279,18 @@ acquire it immediately after, with no leftover state to detect or clear).
    a plain 400 response, not a network exception, so without this a run could finish and log
    normally while the summary silently never arrived. Caught by hand: the silent-video failure above
    was verbose enough, stacked with a couple other failures in the same run, to trigger exactly that.
+   Telegram's Bot API silently deletes any update left unfetched for 24h - hit for real when the
+   PC was off ~35h and 4 of 5 queued links vanished while the run reported a clean "1 ok". Nothing
+   in code can recover those (a bot can't read chat history), so `check_dropped_updates` makes the
+   loss visible instead: it compares this fetch's time against `last_fetch_at` (config state, saved
+   only *after* the warning is in `log.txt`, so a crash mid-run re-derives it next time rather than
+   losing it) and the first returned `update_id` against `last_update_id + 1`. Over 24h with a gap
+   gives a count (an upper bound - link-preview edits are updates too) plus the exact send window
+   to resend from; over 24h with no updates returned, or over a week (update_ids restart randomly),
+   gives a conditional "if you sent anything in this window" warning; a gap *under* 24h means
+   something else is calling `getUpdates` on this bot. Shown first in both `log.txt` and the
+   Telegram summary, and a warning alone is enough to bypass the "Nothing new" early exit. The real
+   fix is an always-on machine; this only guarantees a loss is never silent.
 
 `config.json` (gitignored, real secrets/state) vs `config.example.json` (committed template) is the
 only config split; there's no environment-variable or CLI-flag configuration.

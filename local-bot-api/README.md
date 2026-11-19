@@ -28,24 +28,37 @@ has until you deliberately turn this on - nothing about normal links/photos/vide
    "local_bot_api_url": "http://127.0.0.1:8081"
    ```
 
-**You don't need to keep anything running between runs - not even Docker Desktop itself.**
-`collect.py` manages the whole thing automatically at the top of every run:
+**You don't need to keep anything running between runs - not even Docker Desktop itself - and most
+runs never touch Docker at all.** `collect.py` doesn't start any of this up front just because
+`local_bot_api_url` is set; it only kicks in **on demand**, the moment a file actually turns out to
+be too big for the free public API:
 
-1. Checks if Docker's daemon is reachable; if not, launches Docker Desktop and waits for it
-   (handles a fully cold machine - PC off overnight, turned on once and left alone - even though
-   Docker Desktop's own "start at login" setting isn't enabled).
-2. Starts the container (`docker start`, harmless no-op if it's somehow already running) and polls
+1. Every download always tries the real API first. If that succeeds (true for the overwhelming
+   majority of files), nothing below this point ever runs - no Docker, no window, no delay.
+2. Only on an actual "file is too big" response does it fall back: checks if Docker's daemon is
+   reachable, and if not, launches Docker Desktop and waits for it (handles a fully cold machine -
+   PC off overnight, turned on once and left alone - even though Docker Desktop's own "start at
+   login" setting isn't enabled).
+3. Right after launching it, it finds Docker Desktop's window and minimizes it - it's
+   Electron-based and creates its own window regardless of the launching process's requested
+   window style, so a plain "start it hidden" request doesn't work; this actively grabs the window
+   after the fact and minimizes it directly. It still flashes on screen for the few seconds the
+   window takes to first appear, just not indefinitely - meant to keep this from being a jarring
+   interruption if you're mid-game when a batch happens to hit a large file.
+4. Starts the container (`docker start`, harmless no-op if it's somehow already running) and polls
    it until it's actually accepting connections - `docker start` returns well before the server
    inside is ready, confirmed by hand that the first real request right after a bare start
    reliably fails.
-3. Runs normally.
-4. When the run ends (success, failure, or Ctrl+C), stops the container with a clean `docker stop`,
-   then kills Docker Desktop entirely (`taskkill`).
+5. Downloads that one file through it, then carries on with the rest of the run normally.
+6. When the run ends (success, failure, or Ctrl+C) - *if* Docker was ever started - stops the
+   container with a clean `docker stop`, then kills Docker Desktop entirely (`taskkill`).
 
-Confirmed by hand end-to-end from a genuinely cold start: Docker Desktop fully quit, daemon
-unreachable, a real run launched it, waited, did real Telegram work, and tore everything back down
-again afterward - nothing Docker-related left running. `docker compose up -d` is only ever needed
-once, manually, the very first time, to create the container at all.
+Confirmed by hand end-to-end from a genuinely cold start, using a real file: Docker Desktop fully
+quit, daemon unreachable, a synthetic 21MB file sent through the real bot, the on-demand trigger
+launched Docker, minimized its window, started the container, and downloaded the file (verified
+byte-for-byte against the original) - all without ever being told up front that this run would
+need Docker. Everything was torn back down again right after. `docker compose up -d` is only ever
+needed once, manually, the very first time, to create the container at all.
 
 That's it - but **only file downloads actually route through your local server, not everything**.
 `getUpdates`/`sendMessage` always use the real `api.telegram.org`, no matter what this is set to.

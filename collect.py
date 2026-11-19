@@ -120,25 +120,54 @@ def advance_last_update_id(cfg: dict, update_id: int) -> None:
 
 
 # --- telegram -------------------------------------------------------------------
-def tg_api_base(cfg: dict) -> str:
-    """The real api.telegram.org, unless a self-hosted local Bot API server is configured (see
-    local-bot-api/README.md) - that's the only thing that lifts the public API's hard 20MB
-    download / 50MB upload caps. Only ever used by tg_download_file's getFile call, deliberately -
-    getUpdates/sendMessage always use the real API regardless of this, since a local server
-    assigns its own update_id sequence, completely disconnected from the real one for the exact
-    same messages (confirmed by hand: the same file was 958651485 there vs. 649679817 here, and it
-    even dropped 2 of 6 real pending messages outright). last_update_id has to mean the same thing
-    every run, or a stored local-server value would make the real API's offset-based getUpdates
-    stop seeing new messages forever once this is turned off again. Dormant by default: nothing
-    changes unless "local_bot_api_url" is actually set in config.json."""
-    return cfg.get("local_bot_api_url") or "https://api.telegram.org"
-
-
 def tg_get_updates(token: str, offset: int) -> list:
     r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates",
                       params={"offset": offset}, timeout=30)
     r.raise_for_status()
     return r.json()["result"]
+
+
+TELEGRAM_RETENTION = dt.timedelta(hours=24)       # Bot API deletes unfetched updates after this
+TELEGRAM_ID_RESET_AFTER = dt.timedelta(days=7)    # after a week with no updates, update_id restarts randomly
+
+
+def check_dropped_updates(prev_fetch_at, fetch_at: dt.datetime, expected_first_id: int,
+                          updates: list):
+    """Returns a warning string if Telegram likely dropped messages before this fetch, else None.
+
+    Telegram keeps a bot's unfetched updates for at most 24h, then deletes them silently - no
+    error, they just never show up in getUpdates. Hit for real: the PC was off ~34h, 4 of 5 queued
+    links were gone, and the run reported a clean "1 ok" with nothing hinting anything was lost.
+    update_ids are sequential, so a gap between last_update_id+1 and the first update actually
+    returned is a missing update (edits/link-preview updates count too, so it's an upper bound on
+    links). With no updates returned, or after a week (ids restart randomly), the count is
+    unknowable - then it's a conditional "if you sent anything in this window" warning instead."""
+    if not prev_fetch_at:
+        return None  # first run with this check - no previous fetch time to compare against
+    try:
+        prev = dt.datetime.fromisoformat(prev_fetch_at)
+    except ValueError:
+        return None
+    fmt = "%Y-%m-%d %H:%M"
+    elapsed = fetch_at - prev
+    gap = updates[0]["update_id"] - expected_first_id if updates else None
+    if elapsed <= TELEGRAM_RETENTION:
+        if gap and gap > 0:
+            return (f"{gap} update(s) went missing since the last check ({prev:{fmt}}) even though "
+                    f"less than 24h passed - something else may be calling getUpdates on this bot. "
+                    f"Resend any links that never got a result.")
+        return None
+    if gap == 0:
+        return None  # first waiting update is exactly the next expected one - nothing was lost
+    cutoff = fetch_at - TELEGRAM_RETENTION
+    window = f"between {prev:{fmt}} and {cutoff:{fmt}}"
+    hours = f"{elapsed.total_seconds() / 3600:.0f}h"
+    if gap and gap > 0 and elapsed < TELEGRAM_ID_RESET_AFTER:
+        return (f"Last check was {hours} ago and Telegram deletes unread bot messages after 24h - "
+                f"{gap} update(s) were lost (link previews/edits count too, so likely fewer links). "
+                f"Resend anything you sent {window}.")
+    return (f"Last check was {hours} ago and Telegram deletes unread bot messages after 24h - "
+            f"if you sent anything {window}, it was lost. Resend those links.")
 
 
 def tg_send_message(token: str, chat_id, text: str) -> None:
@@ -165,6 +194,60 @@ def _docker_daemon_ready() -> bool:
         return False
 
 
+def _minimize_docker_desktop_window(attempts: int = 20, delay: float = 0.5) -> None:
+    """Docker Desktop is Electron-based and creates its own window regardless of the launching
+    process's requested window style (confirmed by hand: Start-Process -WindowStyle Hidden still
+    produced a fully visible, focus-stealing window) - the only way to keep it off-screen is to
+    find the actual window after the fact and minimize it directly via the Win32 API, the same
+    technique a published PowerShell module (GenXdev) uses for this exact problem. Windows-only
+    and purely cosmetic: never raises, never blocks startup - if the window can't be found in time
+    (or this isn't Windows), the daemon-readiness wait that follows just proceeds with the window
+    left alone. Confirmed by hand: IsIconic true (genuinely minimized, not just a no-op call) after
+    finding a real launched window. Worth the trouble because a popup stealing focus is genuinely
+    disruptive mid-game, not just mid-work - it still flashes on screen for a moment first (the
+    window takes a few seconds to even exist), just not indefinitely."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    def get_process_name(pid):
+        h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(260)
+            size = wintypes.DWORD(260)
+            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return buf.value
+            return ""
+        finally:
+            kernel32.CloseHandle(h)
+
+    for _ in range(attempts):
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def callback(hwnd, lparam):
+            if not user32.IsWindowVisible(hwnd) or user32.GetWindowTextLengthW(hwnd) == 0:
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if get_process_name(pid.value).lower().endswith("docker desktop.exe"):
+                found.append(hwnd)
+            return True
+
+        user32.EnumWindows(callback, 0)
+        if found:
+            for hwnd in found:
+                user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+            return
+        time.sleep(delay)
+
+
 def ensure_docker_desktop_running(cfg: dict, attempts: int = 60, delay: float = 2.0) -> None:
     """Launches Docker Desktop if its daemon isn't already reachable, and waits for it to come up.
     This machine doesn't have Docker Desktop's own "start at login" setting enabled, and even one
@@ -181,6 +264,7 @@ def ensure_docker_desktop_running(cfg: dict, attempts: int = 60, delay: float = 
                            f'"{exe}" to launch it - set "docker_desktop_exe" in config.json if '
                            f"it's installed somewhere else.")
     subprocess.Popen([exe])
+    _minimize_docker_desktop_window()
     for attempt in range(attempts):
         if _docker_daemon_ready():
             return
@@ -243,47 +327,73 @@ def stop_docker_desktop() -> None:
         print(f"  (warning: failed to stop Docker Desktop: {e})", flush=True)
 
 
+def _tg_getfile_error(r: requests.Response) -> str:
+    # requests' own raise_for_status() only gives "400 Client Error: Bad Request for url: ..." -
+    # Telegram's real reason (e.g. "file is too big") is in the JSON body, thrown away by default.
+    try:
+        return r.json().get("description", r.text)
+    except ValueError:
+        return r.text
+
+
 def tg_download_file(token: str, file_id: str, dest_path: Path, cfg: dict) -> None:
     """Downloads a Telegram-hosted file (voice note/audio/document attachment) - no yt-dlp
-    involved, this isn't a social-media link. Against the real api.telegram.org, getFile's
-    file_path is a relative path downloaded over HTTP, same as always - the public API hard-caps
-    this at 20MB (this is the whole reason local-bot-api/ exists). Against a self-hosted local Bot
-    API server (TELEGRAM_LOCAL=1 - see local-bot-api/README.md), file_path is instead an *absolute
-    path inside that server's own container*, under LOCAL_BOT_API_CONTAINER_DIR - and the old HTTP
-    route is simply gone in this mode (confirmed by hand: a real getFile there now 404s). Pulling
-    the file out with `docker cp` instead works regardless of how the container's volume is set
-    up (named volume or bind mount) - verified against a real local server: a host bind-mount
-    straight to /var/lib/telegram-bot-api crashes the server outright (SIGABRT), since
-    telegram-bot-api names each bot's data directory after the literal token, which contains a
-    colon - an invalid path character on Windows. `docker cp` sidesteps that entirely by going
-    through the Docker daemon instead of the host filesystem."""
-    base_url = tg_api_base(cfg)
-    # In local mode, the server fetches the file's actual bytes over MTProto before this call can
-    # return at all - confirmed by hand that a 58MB file took well over 15s (succeeded at 60s) on
-    # its first request, so this needs real headroom, not the quick metadata-lookup timeout that's
-    # enough against the real API.
-    r = requests.get(f"{base_url}/bot{token}/getFile",
-                      params={"file_id": file_id}, timeout=180)
-    if not r.ok:
-        # requests' own raise_for_status() only gives "400 Client Error: Bad Request for url:
-        # ..." - Telegram's real reason (e.g. "file is too big", the Bot API's hard 20 MB
-        # download cap, hit on a real ~20-minute voice note) is in the JSON body, thrown away by
-        # default. Surfacing it here is the difference between a useless error and an actionable
-        # one, both in log.txt and the Telegram summary.
-        try:
-            desc = r.json().get("description", r.text)
-        except ValueError:
-            desc = r.text
+    involved, this isn't a social-media link. Always tries the real api.telegram.org first - cheap,
+    no Docker involved, and correct for the overwhelming majority of files (anything under the
+    public API's 20MB cap). Docker/the local server (local-bot-api/README.md) only get started as
+    a fallback, on demand, the moment a file genuinely turns out to be too big - never upfront on
+    every run regardless of whether anything in this batch actually needs it. This also means a
+    Docker/Docker Desktop problem only fails the one job that needed it, not the whole run."""
+    r = requests.get(f"https://api.telegram.org/bot{token}/getFile",
+                      params={"file_id": file_id}, timeout=30)
+    if r.ok:
+        file_path = r.json()["result"]["file_path"]
+        r2 = requests.get(f"https://api.telegram.org/file/bot{token}/{file_path}", timeout=120)
+        r2.raise_for_status()
+        dest_path.write_bytes(r2.content)
+        return
+
+    desc = _tg_getfile_error(r)
+    local_url = cfg.get("local_bot_api_url")
+    if "too big" not in desc.lower() or not local_url:
         raise RuntimeError(f"Telegram getFile failed: {desc}")
+
+    # Genuinely too big for the public API, and a local server is configured - start it now, only
+    # because this specific file actually needs it. start_local_bot_api/atexit registration are
+    # both safely idempotent, so calling this again for a second oversized file later in the same
+    # run just confirms it's already up rather than restarting anything.
+    container = cfg.get("local_bot_api_container_name") or LOCAL_BOT_API_CONTAINER_NAME
+    try:
+        start_local_bot_api(container, local_url, cfg)
+    except Exception as e:
+        raise RuntimeError(f"file too big for the public API, and couldn't start the local Bot "
+                           f"API server ({container}) to handle it: {e}") from e
+    atexit.register(stop_docker_desktop)
+    atexit.register(stop_local_bot_api, container)
+
+    # The local server fetches the file's actual bytes over MTProto before this call can return at
+    # all - confirmed by hand that a 58MB file took well over 15s (succeeded at 60s) on its first
+    # request, so this needs real headroom, not the quick timeout that's enough against the
+    # public API's lightweight metadata-only response.
+    r = requests.get(f"{local_url}/bot{token}/getFile", params={"file_id": file_id}, timeout=180)
+    if not r.ok:
+        raise RuntimeError(f"Telegram getFile failed (local server): {_tg_getfile_error(r)}")
     file_path = r.json()["result"]["file_path"]
 
-    if cfg.get("local_bot_api_url") and file_path.startswith(LOCAL_BOT_API_CONTAINER_DIR):
-        container = cfg.get("local_bot_api_container_name") or LOCAL_BOT_API_CONTAINER_NAME
+    if file_path.startswith(LOCAL_BOT_API_CONTAINER_DIR):
+        # Local mode (TELEGRAM_LOCAL=1): file_path is an absolute path *inside the server's own
+        # container*, not a URL - the old HTTP download route is simply gone in this mode
+        # (confirmed by hand: a real getFile there now 404s). `docker cp` pulls it out instead,
+        # working regardless of how the container's volume is set up - verified against a real
+        # local server: a host bind-mount straight to /var/lib/telegram-bot-api crashes the server
+        # outright (SIGABRT), since telegram-bot-api names each bot's data directory after the
+        # literal token, which contains a colon - an invalid path character on Windows. `docker cp`
+        # sidesteps that entirely by going through the Docker daemon instead of the host filesystem.
         subprocess.run(["docker", "cp", f"{container}:{file_path}", str(dest_path)],
                        check=True, capture_output=True, text=True)
         return
 
-    r2 = requests.get(f"{base_url}/file/bot{token}/{file_path}", timeout=120)
+    r2 = requests.get(f"{local_url}/file/bot{token}/{file_path}", timeout=120)
     r2.raise_for_status()
     dest_path.write_bytes(r2.content)
 
@@ -505,12 +615,28 @@ def download_post(url: str, dest_dir: Path, cfg: dict) -> dict:
 
 
 # --- OCR (for image posts/carousels - on-image text the caption alone misses) ---
+OCR_VRAM_MB = 2560  # measured: about 2.5 GB in use after OCRing a carousel of dense small print
+
+
 def load_ocr_engine():
     # Same engine + settings already proven in Instagram-Autopost/ig-research/reocr_full_corpus.py
+    # paddlepaddle-gpu is installed without its own CUDA packages and relies on the CUDA libraries
+    # torch loads, which works because collect.py always imports torch first.
+    import paddle
     from paddleocr import PaddleOCR
+    device = "cpu"
+    if paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
+        busy = gpu_busy_reason(OCR_VRAM_MB)
+        if busy:
+            print(f"  {busy} - running OCR on the CPU for this run instead", flush=True)
+        else:
+            device = "gpu:0"
+    else:
+        note_missing_gpu_build("PaddleOCR")
+    print(f"  PaddleOCR device: {device}", flush=True)
     return PaddleOCR(
         lang="en", use_doc_orientation_classify=False, use_doc_unwarping=False,
-        use_textline_orientation=False, enable_mkldnn=False,
+        use_textline_orientation=False, enable_mkldnn=False, device=device,
     )
 
 
@@ -679,9 +805,79 @@ def unique_dest(parent: Path, name: str) -> Path:
 
 
 # --- transcription ---------------------------------------------------------------
+GPU_BUSY_UTIL_PERCENT = 30  # average load at or above this means something else is using the GPU
+GPU_BUSY_SAMPLES = 3        # GPU load is spiky - a single reading can catch a momentary blip
+WHISPER_VRAM_MB = {"tiny": 1024, "base": 1024, "small": 2048, "medium": 5120, "large": 10240,
+                   "turbo": 6144}  # openai-whisper's published requirements
+
+
+DEVICE_WARNINGS = []  # reported in log.txt and the Telegram summary at the end of the run
+
+
+def note_missing_gpu_build(library: str) -> None:
+    """Records a warning when an NVIDIA GPU is present but this install can't use it. A plain
+    `pip install` on Windows silently gets CPU-only builds, which went unnoticed here for months
+    because everything still worked, just several times slower."""
+    if shutil.which("nvidia-smi"):
+        warning = (f"{library} can't use the NVIDIA GPU in this install, so it's running on the "
+                   f"CPU - see \"GPU setup\" in README.md")
+        print(f"WARNING: {warning}", flush=True)
+        if warning not in DEVICE_WARNINGS:
+            DEVICE_WARNINGS.append(warning)
+
+
+_GPU_UNCHECKED = object()
+_gpu_verdict = _GPU_UNCHECKED
+
+
+def gpu_busy_reason(needed_mb: int):
+    """Returns this run's GPU verdict, reading it only the first time it's asked for. That first
+    call happens before the run has put any load on the GPU; checking again later would mistake
+    our own work for someone else's (caught for real: OCR finishing left the GPU reading 33% busy,
+    which sent Whisper to the CPU for the whole run)."""
+    global _gpu_verdict
+    if _gpu_verdict is _GPU_UNCHECKED:
+        _gpu_verdict = _read_gpu_busy_reason(needed_mb)
+    return _gpu_verdict
+
+
+def _read_gpu_busy_reason(needed_mb: int):
+    """Returns why the GPU shouldn't be used for this run (already under load, or less free VRAM
+    than needed_mb), or None if it's free. Being unable to tell (nvidia-smi missing, or reporting
+    [N/A]) also returns None: the library already confirmed CUDA works, so an unreadable
+    monitoring tool isn't a reason to give up the much faster device."""
+    utils = []
+    used = total = 0
+    for i in range(GPU_BUSY_SAMPLES):
+        if i:
+            time.sleep(1)
+        try:
+            r = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+                                "--format=csv,noheader,nounits"],
+                               capture_output=True, text=True, timeout=10)
+            util, used, total = (int(x) for x in r.stdout.splitlines()[0].split(","))
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            return None
+        utils.append(util)
+    avg_util = sum(utils) / len(utils)
+    if avg_util >= GPU_BUSY_UTIL_PERCENT:
+        return f"GPU is {avg_util:.0f}% busy"
+    if total - used < needed_mb:
+        return f"only {total - used} MB of GPU memory free, about {needed_mb} MB needed"
+    return None
+
+
 def load_whisper(cfg: dict):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     model_name = cfg.get("whisper_model", "small")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        needed = WHISPER_VRAM_MB.get(re.split(r"[.-]", model_name)[0], WHISPER_VRAM_MB["small"])
+        busy = gpu_busy_reason(needed)
+        if busy:
+            print(f"{busy} - using the CPU for this run instead", flush=True)
+            device = "cpu"
+    else:
+        note_missing_gpu_build("Whisper")
     print(f"loading Whisper model '{model_name}' ({device})...", flush=True)
     return whisper.load_model(model_name, device=device), device
 
@@ -732,30 +928,21 @@ def main() -> int:
     output_root = Path(cfg["output_root"])
     output_root.mkdir(parents=True, exist_ok=True)
 
-    if cfg.get("local_bot_api_url"):
-        # getUpdates/sendMessage deliberately stay on the real api.telegram.org even when this is
-        # configured - only tg_download_file's getFile call actually uses it. Root-caused by hand:
-        # a self-hosted local server assigns its own update_id sequence, completely disconnected
-        # from the real API's numbering for the exact same messages (e.g. 958651485 there vs.
-        # 649679817 here, for the identical file) - it even dropped 2 of 6 real pending messages
-        # entirely. last_update_id has to mean the same thing every run regardless of whether this
-        # is configured, or a stored local-server value would make the real API's offset-based
-        # getUpdates stop seeing new messages forever (its own numbering will never catch up to
-        # one that high). file_id, unlike update_id, is confirmed portable between the two servers.
-        container = cfg.get("local_bot_api_container_name") or LOCAL_BOT_API_CONTAINER_NAME
-        try:
-            start_local_bot_api(container, cfg["local_bot_api_url"], cfg)
-        except Exception as e:
-            print(f"Couldn't start the local Bot API container ({container}): {e}\n"
-                  f"Is Docker Desktop running? See local-bot-api/README.md.", file=sys.stderr)
-            return 1
-        # Registered in this order (not the reverse) because atexit runs LIFO: stop_local_bot_api
-        # - a clean `docker stop` - needs to fire *before* stop_docker_desktop yanks the whole
-        # backend out from under it.
-        atexit.register(stop_docker_desktop)
-        atexit.register(stop_local_bot_api, container)
-
-    updates = tg_get_updates(token, cfg.get("last_update_id", 0) + 1)
+    # Docker/the local Bot API server, if configured, are deliberately *not* started here - only
+    # tg_download_file starts them, on demand, the moment a file actually turns out to be too big
+    # for the public API. Most runs never touch an oversized file, so most runs never see Docker
+    # at all - no unconditional startup cost, no Docker Desktop window popping up (even briefly)
+    # on a run that didn't need it.
+    fetch_at = dt.datetime.now()
+    expected_first_id = cfg.get("last_update_id", 0) + 1
+    updates = tg_get_updates(token, expected_first_id)
+    # last_fetch_at is only saved once this warning has made it into log.txt (or there was nothing
+    # to warn about) - if the run crashes first, the next run still measures from the older fetch
+    # time and re-derives the same warning instead of losing it.
+    dropped_warning = check_dropped_updates(cfg.get("last_fetch_at"), fetch_at,
+                                            expected_first_id, updates)
+    if dropped_warning:
+        print(f"WARNING: {dropped_warning}", flush=True)
 
     if cfg.get("chat_id") is None:
         if not updates:
@@ -942,6 +1129,7 @@ def main() -> int:
                             "\n\n".join(blocks) + "\n", encoding="utf-8")
 
                 transcripts = []  # (video_path, whisper result) for each video that transcribed ok
+                silent_in_post = []  # video names with no audio track - reported once final_dir exists
                 for vp in post["video_paths"]:
                     print(f"  transcribing carousel video: {vp.name}", flush=True)
                     try:
@@ -952,6 +1140,13 @@ def main() -> int:
                             (vp, transcribe_video(model, device, vp, stage_dir, job["delete_video"])))
                         transcribe_ok += 1
                     except Exception as e:
+                        if "no audio track" in str(e):
+                            # same as the single-video case: a fixed fact about the clip, not a
+                            # failure - it's kept (not in `transcripts`, so never deletable)
+                            print(f"  no audio track ({vp.name}) - keeping video, skipping transcript",
+                                  flush=True)
+                            silent_in_post.append(vp.name)
+                            continue
                         print(f"  TRANSCRIBE FAILED ({vp.name}): {e}", flush=True)
                         transcribe_failures.append(
                             (f"{job['url']} [{vp.name}]", f"transcription error: {e}"))
@@ -984,6 +1179,7 @@ def main() -> int:
                 final_name = build_final_name("", naming_source, fallback_id=stage_dir.name)
                 final_dir = unique_dest(stage_dir.parent, final_name)
                 stage_dir.rename(final_dir)
+                silent_videos.extend(f"{final_dir.name} [{name}]" for name in silent_in_post)
 
                 # re-point every path at final_dir now that the rename moved the files under it
                 transcripts = [(final_dir / vp.name, result) for vp, result in transcripts]
@@ -1123,7 +1319,9 @@ def main() -> int:
         return 130
 
     # --- log + notify ---------------------------------------------------------
-    if not jobs and not staging_dirs and not cancel_seen and not skipped:
+    if not jobs and not staging_dirs and not cancel_seen and not skipped and not dropped_warning:
+        cfg["last_fetch_at"] = fetch_at.isoformat(timespec="seconds")
+        save_config(cfg)
         print("Nothing new.")
         return 0
 
@@ -1145,6 +1343,10 @@ def main() -> int:
         f"downloaded: {download_ok} ok, {len(download_failures)} failed",
         f"transcribed: {transcribe_ok} ok, {len(transcribe_failures)} failed",
     ]
+    if dropped_warning:
+        log_lines.append(f"DROPPED BY TELEGRAM: {dropped_warning}")
+    for warning in DEVICE_WARNINGS:
+        log_lines.append(f"GPU SETUP: {warning}")
     if cancel_seen:
         log_lines.append(f"cancelled: {cancelled_count} queued link(s) discarded (received \"c\")")
     if all_failures:
@@ -1173,8 +1375,14 @@ def main() -> int:
     log_lines.append("")
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write("\n".join(log_lines) + "\n")
+    cfg["last_fetch_at"] = fetch_at.isoformat(timespec="seconds")
+    save_config(cfg)
 
     summary_parts = []
+    if dropped_warning:
+        summary_parts.append(f"WARNING: {dropped_warning}")
+    for warning in DEVICE_WARNINGS:
+        summary_parts.append(f"WARNING: {warning}")
     if cancel_seen:
         summary_parts.append(f"Cancelled: {cancelled_count} queued link(s) discarded.")
     if jobs or staging_dirs:

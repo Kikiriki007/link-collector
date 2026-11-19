@@ -46,9 +46,8 @@ for search and rewatch, not pixel-peeping.
   two ML frameworks are most of that), plus ~600 MB for model weights, downloaded once on first
   use and cached under your user profile. Your archive folder grows on top of that with every
   video you keep.
-- **CPU-only is fine** for occasional/personal use - no GPU required. An NVIDIA GPU with a CUDA
-  build of PyTorch (installed yourself, see [pytorch.org](https://pytorch.org/get-started/locally/))
-  transcribes faster, but that's optional.
+- **CPU-only works**, but an NVIDIA GPU is much faster for both transcription and OCR. It needs
+  several GB of extra disk space - see "GPU setup" below.
 - The daily-automation piece (`setup_task.ps1`, Windows Task Scheduler) is **Windows-only**;
   `collect.py` itself is plain Python and runs fine by hand on macOS/Linux, or via cron there.
 - **~5 minutes for manual setup** - see Setup below.
@@ -169,9 +168,28 @@ python -m venv .venv
 # source .venv/bin/activate && pip install -r requirements.txt   # macOS/Linux
 ```
 
-That installs `yt-dlp`, `openai-whisper`, `paddleocr`/`paddlepaddle`, and `requests` — see
-Requirements above for what that costs in disk space. Model weights download on first use; that
-first run will be slower than every run after it.
+That installs `yt-dlp`, `openai-whisper`, `paddleocr`, and `requests` — see Requirements above for
+what that costs in disk space. Model weights download on first use; that first run will be slower
+than every run after it.
+
+Then install PaddlePaddle, which OCR needs. Choose one of these:
+
+**No NVIDIA GPU:**
+
+```
+.venv\Scripts\python -m pip install paddlepaddle
+```
+
+**GPU setup (NVIDIA GPU on Windows):** a plain install gives you CPU-only PyTorch, so replace it
+and add the GPU build of PaddlePaddle:
+
+```
+.venv\Scripts\python -m pip install --force-reinstall --no-deps torch==2.14.0 --index-url https://download.pytorch.org/whl/cu132
+.venv\Scripts\python -m pip install --no-deps paddlepaddle-gpu==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
+```
+
+`pip check` will list missing `nvidia-*` packages after this. That's expected: PaddlePaddle uses the
+CUDA libraries that come with PyTorch. If the GPU is busy when a run needs it, that run uses the CPU.
 
 ### 2. Create your Telegram bot
 

@@ -4,4 +4,5 @@ curl_cffi>=0.11
 openai-whisper
 requests
 paddleocr
-paddlepaddle
+# PaddlePaddle and the GPU build of PyTorch are installed separately because the right build
+# depends on the machine - see "GPU setup" in README.md.
